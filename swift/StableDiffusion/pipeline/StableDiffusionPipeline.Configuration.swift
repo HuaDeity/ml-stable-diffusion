@@ -12,6 +12,7 @@ public enum PipelineMode {
 }
 
 /// Image generation configuration
+@available(iOS 16.2, macOS 13.1, *)
 public struct PipelineConfiguration: Hashable {
     
     /// Text prompt to guide sampling
@@ -36,6 +37,10 @@ public struct PipelineConfiguration: Hashable {
     public var seed: UInt32 = 0
     /// Controls the influence of the text prompt on sampling process (0=random images)
     public var guidanceScale: Float = 7.5
+    /// Controls the influence of the image on sampling process (for ViS2O)
+    public var imageGuidanceScale: Float = 1.5
+    /// Enable 8-channel UNet mode (concatenate image latents with noise latents for ViS2O)
+    public var use8ChannelUNet: Bool = false
     /// List of Images for available ControlNet Models
     public var controlNetInputs: [CGImage] = []
     /// Safety checks are only performed if `self.canSafetyCheck && !disableSafety`

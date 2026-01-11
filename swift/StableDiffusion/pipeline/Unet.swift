@@ -96,8 +96,12 @@ public struct Unet: ResourceManaging {
 
         // Match time step batch dimension to the model / latent samples
         let t: MLShapedArray<Float32>
-        if hiddenStates.shape[0] == 2 {
+        let batchSize = hiddenStates.shape[0]
+        if batchSize == 2 {
             t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
+        } else if batchSize == 3 {
+            // For ViS2O triple guidance
+            t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep), Float(timeStep)], shape: [3])
         } else {
             t = MLShapedArray(scalars: [Float(timeStep)], shape: [1])
         }

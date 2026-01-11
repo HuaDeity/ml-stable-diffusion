@@ -4,13 +4,6 @@
 import Accelerate
 import CoreML
 
-/// How to space timesteps for inference
-public enum TimeStepSpacing {
-    case linspace
-    case leading
-    case karras
-}
-
 /// A scheduler used to compute a de-noised image
 ///
 ///  This implementation matches:
@@ -84,7 +77,7 @@ public final class DPMSolverMultistepScheduler: Scheduler {
         self.alphasCumProd = alphasCumProd
 
         switch timeStepSpacing {
-        case .linspace:
+        case .linspace, .trailing:
             self.timeSteps = linspace(0, Float(self.trainStepCount-1), stepCount+1).dropFirst().reversed().map { Int(round($0)) }
             self.alpha_t = vForce.sqrt(self.alphasCumProd)
             self.sigma_t = vForce.sqrt(vDSP.subtract([Float](repeating: 1, count: self.alphasCumProd.count), self.alphasCumProd))

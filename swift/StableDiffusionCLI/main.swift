@@ -71,6 +71,12 @@ struct StableDiffusionSample: ParsableCommand {
     @Option(help: "Controls the influence of the text prompt on sampling process (0=random images)")
     var guidanceScale: Float = 7.5
 
+    @Option(help: "Controls the influence of the image on sampling process (for ViS2O)")
+    var imageGuidanceScale: Float = 1.5
+
+    @Flag(help: "Enable 8-channel UNet mode for ViS2O (concatenate image latents with noise latents)")
+    var use8ChannelUNet: Bool = false
+
     @Option(help: "Compute units to load model with {all,cpuOnly,cpuAndGPU,cpuAndNeuralEngine}")
     var computeUnits: ComputeUnits = .all
 
@@ -213,6 +219,8 @@ struct StableDiffusionSample: ParsableCommand {
         pipelineConfig.seed = seed
         pipelineConfig.controlNetInputs = controlNetInputs
         pipelineConfig.guidanceScale = guidanceScale
+        pipelineConfig.imageGuidanceScale = imageGuidanceScale
+        pipelineConfig.use8ChannelUNet = use8ChannelUNet
         pipelineConfig.schedulerType = scheduler.stableDiffusionScheduler
         pipelineConfig.rngType = rng.stableDiffusionRNG
         pipelineConfig.useDenoisedIntermediates = true

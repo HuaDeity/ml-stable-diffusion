@@ -15,6 +15,8 @@ public enum StableDiffusionScheduler {
     case dpmSolverMultistepScheduler
     /// Scheduler for rectified flow based multimodal diffusion transformer models
     case discreteFlowScheduler
+    /// Scheduler that uses ancestral sampling with Euler method steps
+    case eulerAncestralDiscreteScheduler
 }
 
 /// RNG compatible with StableDiffusionPipeline
@@ -51,8 +53,8 @@ public protocol StableDiffusionPipelineProtocol: ResourceManaging {
 }
 
 @available(iOS 16.2, macOS 13.1, *)
-public extension StableDiffusionPipelineProtocol {
-    var canSafetyCheck: Bool { false }
+extension StableDiffusionPipelineProtocol {
+    public var canSafetyCheck: Bool { false }
 }
 
 /// A pipeline used to generate image samples from text input using stable diffusion
@@ -70,13 +72,13 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 
     /// Model used to generate final image from latent diffusion process
     var decoder: Decoder
-    
+
     /// Model used to latent space for image2image, and soon, in-painting
     var encoder: Encoder?
 
     /// Optional model for checking safety of generated image
     var safetyChecker: SafetyChecker? = nil
-    
+
     /// Optional model used before Unet to control generated images by additonal inputs
     var controlNet: ControlNet? = nil
 
@@ -213,9 +215,17 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         // Encode the input prompt
         var promptEmbedding = try textEncoder.encode(config.prompt)
 
-        if config.guidanceScale >= 1.0 {
-            // Convert to Unet hidden state representation
-            // Concatenate the prompt and negative prompt embeddings
+        // Dual guidance for ViS2O: [image_conditional, unconditional]
+        // Updated to match batch_size=2 model
+        let useDualImageGuidance = config.use8ChannelUNet && config.imageGuidanceScale >= 1.0
+
+        if config.use8ChannelUNet {
+            promptEmbedding = MLShapedArray<Float32>(
+                concatenating: [promptEmbedding, promptEmbedding],
+                alongAxis: 0
+            )
+        } else if config.guidanceScale >= 1.0 {
+            // Standard dual guidance: [negative, prompt]
             let negativePromptEmbedding = try textEncoder.encode(config.negativePrompt)
             promptEmbedding = MLShapedArray<Float32>(
                 concatenating: [negativePromptEmbedding, promptEmbedding],
@@ -227,28 +237,80 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             textEncoder.unloadResources()
         }
 
-        let hiddenStates = useMultilingualTextEncoder ? promptEmbedding : toHiddenStates(promptEmbedding)
+        let hiddenStates =
+            useMultilingualTextEncoder ? promptEmbedding : toHiddenStates(promptEmbedding)
 
         /// Setup schedulers
         let scheduler: [Scheduler] = (0..<config.imageCount).map { _ in
             switch config.schedulerType {
             case .pndmScheduler: return PNDMScheduler(stepCount: config.stepCount)
-            case .dpmSolverMultistepScheduler: return DPMSolverMultistepScheduler(stepCount: config.stepCount, timeStepSpacing: config.schedulerTimestepSpacing)
-            case .discreteFlowScheduler: return DiscreteFlowScheduler(stepCount: config.stepCount, timeStepShift: config.schedulerTimestepShift)
+            case .dpmSolverMultistepScheduler:
+                return DPMSolverMultistepScheduler(
+                    stepCount: config.stepCount, timeStepSpacing: config.schedulerTimestepSpacing)
+            case .discreteFlowScheduler:
+                return DiscreteFlowScheduler(
+                    stepCount: config.stepCount, timeStepShift: config.schedulerTimestepShift)
+            case .eulerAncestralDiscreteScheduler:
+                return EulerAncestralDiscreteScheduler(
+                    stepCount: config.stepCount, timestepSpacing: config.schedulerTimestepSpacing)
             }
         }
 
-        // Generate random latent samples from specified seed
-        var latents: [MLShapedArray<Float32>] = try generateLatentSamples(configuration: config, scheduler: scheduler[0])
+        // For ViS2O 8-channel mode: handle image separately from noise latents
+        var imageLatents: [MLShapedArray<Float32>]? = nil
+        let savedStartingImage = config.startingImage
+        var configForLatents = config
+        if config.use8ChannelUNet, savedStartingImage != nil {
+            // Clear starting image temporarily so latents are pure noise (4 channels)
+            configForLatents.startingImage = nil
+        }
+
+        // Generate random latent samples from specified seed (4-channel noise latents)
+        var latents: [MLShapedArray<Float32>] = try generateLatentSamples(
+            configuration: configForLatents, scheduler: scheduler[0])
 
         // Store denoised latents from scheduler to pass into decoder
-        var denoisedLatents: [MLShapedArray<Float32>] = latents.map { MLShapedArray(converting: $0) }
+        var denoisedLatents: [MLShapedArray<Float32>] = latents.map {
+            MLShapedArray(converting: $0)
+        }
+
+        // For ViS2O 8-channel mode: extract and prepare image latents for concatenation
+        if config.use8ChannelUNet, let image = savedStartingImage {
+            guard let encoder else {
+                throw PipelineError.startingImageProvidedWithoutEncoder
+            }
+            var random = randomSource(from: config.rngType, seed: config.seed)
+            // Use mean only (no Gaussian sampling) for deterministic image conditioning
+            let encodedLatent = try encoder.encode(
+                image, scaleFactor: config.encoderScaleFactor, random: &random, useMeanOnly: true)
+
+            // VAE encoder outputs 8 channels (mean + logvar), extract first 4 channels (mean)
+            var extractedLatent = encodedLatent
+            if encodedLatent.shape[1] == 8 {
+                // Extract mean channels [0:4]
+                let scalarCount = encodedLatent.shape[2] * encodedLatent.shape[3]
+                var meanScalars = [Float32]()
+                meanScalars.reserveCapacity(4 * scalarCount)
+                for c in 0..<4 {
+                    let channelOffset = c * scalarCount
+                    meanScalars.append(
+                        contentsOf: encodedLatent.scalars[
+                            channelOffset..<(channelOffset + scalarCount)])
+                }
+                extractedLatent = MLShapedArray(
+                    scalars: meanScalars,
+                    shape: [1, 4, encodedLatent.shape[2], encodedLatent.shape[3]])
+            }
+
+            // Replicate for each image in the batch
+            imageLatents = (0..<config.imageCount).map { _ in extractedLatent }
+        }
 
         if reduceMemory {
             encoder?.unloadResources()
         }
         let timestepStrength: Float? = config.mode == .imageToImage ? config.strength : nil
-        
+
         // Convert cgImage for ControlNet into MLShapedArray
         let controlNetConds = try config.controlNetInputs.map { cgImage in
             let shapedArray = try cgImage.planarRGBShapedArray(minValue: 0.0, maxValue: 1.0)
@@ -260,17 +322,46 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 
         // De-noising loop
         let timeSteps: [Int] = scheduler[0].calculateTimesteps(strength: timestepStrength)
-        for (step,t) in timeSteps.enumerated() {
+        for (step, t) in timeSteps.enumerated() {
 
             // Expand the latents for classifier-free guidance
             // and input to the Unet noise prediction model
-            let latentUnetInput: [MLShapedArray<Float32>]
-            if config.guidanceScale >= 1.0 {
+            var latentUnetInput: [MLShapedArray<Float32>]
+            if config.guidanceScale >= 1.0 || useDualImageGuidance {
                 latentUnetInput = latents.map {
                     MLShapedArray<Float32>(concatenating: [$0, $0], alongAxis: 0)
                 }
             } else {
                 latentUnetInput = latents
+            }
+
+            // For ViS2O 8-channel mode: concatenate image latents with noise latents
+            if config.use8ChannelUNet, let imgLatents = imageLatents {
+                latentUnetInput = zip(latentUnetInput, imgLatents).map { noiseLatent, imgLatent in
+                    var expandedImageLatent: MLShapedArray<Float32>
+                    if useDualImageGuidance {
+                        // For dual image guidance: [image, zeros]
+                        let zeros = MLShapedArray<Float32>(repeating: 0.0, shape: imgLatent.shape)
+                        expandedImageLatent = MLShapedArray<Float32>(
+                            concatenating: [imgLatent, zeros],
+                            alongAxis: 0
+                        )
+                    } else if config.guidanceScale >= 1.0 || config.use8ChannelUNet {
+                        // For standard dual guidance: duplicate image latents
+                        expandedImageLatent = MLShapedArray<Float32>(
+                            concatenating: [imgLatent, imgLatent],
+                            alongAxis: 0
+                        )
+                    } else {
+                        expandedImageLatent = imgLatent
+                    }
+
+                    let result = MLShapedArray<Float32>(
+                        concatenating: [noiseLatent, expandedImageLatent],
+                        alongAxis: 1
+                    )
+                    return result
+                }
             }
 
             // Before Unet, execute controlNet and add the output into Unet inputs
@@ -280,43 +371,60 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                 hiddenStates: hiddenStates,
                 images: controlNetConds
             )
-            
+
             // Predict noise residuals from latent samples
             // and current time step conditioned on hidden states
-            var noise : [MLShapedArray<Float32>]
+            var noise: [MLShapedArray<Float32>]
             if unet.latentSampleShape[0] >= 2 || config.guidanceScale < 1.0 {
                 // One predict call from the uNet, using batching if needed
                 noise = try unet.predictNoise(
-                  latents: latentUnetInput,
-                  timeStep: t,
-                  hiddenStates: hiddenStates,
-                  additionalResiduals: additionalResiduals
+                    latents: latentUnetInput,
+                    timeStep: t,
+                    hiddenStates: hiddenStates,
+                    additionalResiduals: additionalResiduals
                 )
             } else {
                 // Serial predictions from uNet
                 var hidden0 = MLShapedArray<Float32>(converting: hiddenStates[0])
-                hidden0 = MLShapedArray(scalars: hidden0.scalars, shape: [1]+hidden0.shape)
+                hidden0 = MLShapedArray(scalars: hidden0.scalars, shape: [1] + hidden0.shape)
                 let noise_pred_uncond = try unet.predictNoise(
-                  latents: latents,
-                  timeStep: t,
-                  hiddenStates: hidden0,
-                  additionalResiduals: additionalResiduals
+                    latents: latents,
+                    timeStep: t,
+                    hiddenStates: hidden0,
+                    additionalResiduals: additionalResiduals
                 )
 
                 var hidden1 = MLShapedArray<Float32>(converting: hiddenStates[1])
-                hidden1 = MLShapedArray(scalars: hidden1.scalars, shape: [1]+hidden1.shape)
+                hidden1 = MLShapedArray(scalars: hidden1.scalars, shape: [1] + hidden1.shape)
                 let noise_pred_text = try unet.predictNoise(
-                  latents: latents,
-                  timeStep: t,
-                  hiddenStates: hidden1,
-                  additionalResiduals: additionalResiduals
+                    latents: latents,
+                    timeStep: t,
+                    hiddenStates: hidden1,
+                    additionalResiduals: additionalResiduals
                 )
 
-                noise = [MLShapedArray<Float32>(concatenating: [noise_pred_uncond[0], noise_pred_text[0]],
-                                                alongAxis: 0)]
+                noise = [
+                    MLShapedArray<Float32>(
+                        concatenating: [noise_pred_uncond[0], noise_pred_text[0]],
+                        alongAxis: 0)
+                ]
             }
 
-            if config.guidanceScale >= 1.0 {
+            // Apply guidance
+            if useDualImageGuidance {
+                noise = performDualImageGuidance(noise, config.imageGuidanceScale)
+            } else if config.use8ChannelUNet {
+                // For ViS2O with CFG disabled: just use first prediction (both are identical)
+                // This matches Python behavior: noise_pred = noise_pred[0:1]
+                noise = noise.map { noisePred in
+                    let shape = noisePred.shape
+                    let singleBatchShape = [1] + shape.dropFirst()
+                    return MLShapedArray<Float32>(
+                        scalars: Array(noisePred.scalars.prefix(shape.dropFirst().reduce(1, *))),
+                        shape: singleBatchShape
+                    )
+                }
+            } else if config.guidanceScale >= 1.0 {
                 noise = performGuidance(noise, config.guidanceScale)
             }
 
@@ -358,10 +466,18 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         return try decodeToImages(denoisedLatents, configuration: config)
     }
 
-    func generateLatentSamples(configuration config: Configuration, scheduler: Scheduler) throws -> [MLShapedArray<Float32>] {
+    func generateLatentSamples(configuration config: Configuration, scheduler: Scheduler) throws
+        -> [MLShapedArray<Float32>]
+    {
         var sampleShape = unet.latentSampleShape
         sampleShape[0] = 1
-        
+
+        // For ViS2O 8-channel mode, generate 4-channel noise latents (not 8-channel)
+        // The other 4 channels will come from the encoded image
+        if config.use8ChannelUNet && sampleShape[1] == 8 {
+            sampleShape[1] = 4
+        }
+
         let stdev = scheduler.initNoiseSigma
         var random = randomSource(from: config.rngType, seed: config.seed)
         let samples = (0..<config.imageCount).map { _ in
@@ -372,13 +488,17 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             guard let encoder else {
                 throw PipelineError.startingImageProvidedWithoutEncoder
             }
-            let latent = try encoder.encode(image, scaleFactor: config.encoderScaleFactor, random: &random)
-            return scheduler.addNoise(originalSample: latent, noise: samples, strength: config.strength)
+            let latent = try encoder.encode(
+                image, scaleFactor: config.encoderScaleFactor, random: &random)
+            return scheduler.addNoise(
+                originalSample: latent, noise: samples, strength: config.strength)
         }
         return samples
     }
 
-    public func decodeToImages(_ latents: [MLShapedArray<Float32>], configuration config: Configuration) throws -> [CGImage?] {
+    public func decodeToImages(
+        _ latents: [MLShapedArray<Float32>], configuration config: Configuration
+    ) throws -> [CGImage?] {
         let images = try decoder.decode(latents, scaleFactor: config.decoderScaleFactor)
         if reduceMemory {
             decoder.unloadResources()
@@ -426,9 +546,9 @@ public struct PipelineProgress {
 }
 
 @available(iOS 16.2, macOS 13.1, *)
-public extension StableDiffusionPipeline {
+extension StableDiffusionPipeline {
     /// Sampling progress details
-    typealias Progress = PipelineProgress
+    public typealias Progress = PipelineProgress
 }
 
 // Helper functions
@@ -450,32 +570,65 @@ extension StableDiffusionPipelineProtocol {
         // Unoptimized manual transpose [0, 2, None, 1]
         // e.g. From [2, 77, 768] to [2, 768, 1, 77]
         let fromShape = embedding.shape
-        let stateShape = [fromShape[0],fromShape[2], 1, fromShape[1]]
+        let stateShape = [fromShape[0], fromShape[2], 1, fromShape[1]]
         var states = MLShapedArray<Float32>(repeating: 0.0, shape: stateShape)
         for i0 in 0..<fromShape[0] {
             for i1 in 0..<fromShape[1] {
                 for i2 in 0..<fromShape[2] {
-                    states[scalarAt:i0,i2,0,i1] = embedding[scalarAt:i0, i1, i2]
+                    states[scalarAt: i0, i2, 0, i1] = embedding[scalarAt: i0, i1, i2]
                 }
             }
         }
         return states
     }
 
-    func performGuidance(_ noise: [MLShapedArray<Float32>], _ guidanceScale: Float) -> [MLShapedArray<Float32>] {
+    func performGuidance(_ noise: [MLShapedArray<Float32>], _ guidanceScale: Float)
+        -> [MLShapedArray<Float32>]
+    {
         noise.map { performGuidance($0, guidanceScale) }
     }
 
-    func performGuidance(_ noise: MLShapedArray<Float32>, _ guidanceScale: Float) -> MLShapedArray<Float32> {
+    func performGuidance(_ noise: MLShapedArray<Float32>, _ guidanceScale: Float) -> MLShapedArray<
+        Float32
+    > {
         var shape = noise.shape
         shape[0] = 1
         return MLShapedArray<Float>(unsafeUninitializedShape: shape) { result, _ in
             noise.withUnsafeShapedBufferPointer { scalars, _, strides in
-                for i in 0 ..< result.count {
+                for i in 0..<result.count {
                     // unconditioned + guidance*(text - unconditioned)
                     result.initializeElement(
                         at: i,
                         to: scalars[i] + guidanceScale * (scalars[strides[0] + i] - scalars[i])
+                    )
+                }
+            }
+        }
+    }
+
+    // ViS2O triple guidance with dual scales
+    func performDualImageGuidance(_ noise: [MLShapedArray<Float32>], _ imageGuidanceScale: Float)
+        -> [MLShapedArray<Float32>]
+    {
+        noise.map { performDualImageGuidance($0, imageGuidanceScale) }
+    }
+
+    func performDualImageGuidance(_ noise: MLShapedArray<Float32>, _ imageGuidanceScale: Float)
+        -> MLShapedArray<Float32>
+    {
+        var shape = noise.shape
+        shape[0] = 1
+        return MLShapedArray<Float>(unsafeUninitializedShape: shape) { result, _ in
+            noise.withUnsafeShapedBufferPointer { scalars, _, strides in
+                for i in 0..<result.count {
+                    // ViS2O dual image guidance formula (image-only CFG):
+                    // uncond + imageScale * (image - uncond)
+                    let imagePred = scalars[i]  // image conditioned
+                    let uncondPred = scalars[strides[0] + i]  // unconditional
+
+                    result.initializeElement(
+                        at: i,
+                        to: uncondPred + imageGuidanceScale * (imagePred - uncondPred)
                     )
                 }
             }

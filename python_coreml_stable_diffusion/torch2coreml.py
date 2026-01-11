@@ -821,9 +821,13 @@ def convert_unet(pipe, args, model_name=None):
     # If original Unet does not exist, export it from PyTorch+diffusers
     elif not os.path.exists(out_path):
         # Prepare sample input shapes and values
-        batch_size = 2  # for classifier-free guidance
-        if args.unet_batch_one:
+        # Determine batch size based on arguments
+        if args.unet_batch_size is not None:
+            batch_size = args.unet_batch_size
+        elif args.unet_batch_one:
             batch_size = 1  # for not using classifier-free guidance
+        else:
+            batch_size = 2  # default: for ViS2O image-only CFG (conditional_image, unconditional_image)
         sample_shape = (
             batch_size,                    # B
             pipe.unet.config.in_channels,  # C
@@ -1721,6 +1725,15 @@ def parser_spec():
         help=
         "If specified, a batch size of one will be used for the unet, this is needed if you do not want to do "
         "classifier free guidance. Default unet batch size is two, which is needed for classifier free guidance."
+        )
+    parser.add_argument(
+        "--unet-batch-size",
+        type=int,
+        default=None,
+        help=
+        "Explicitly set the batch size for the unet (1, 2, or 3). "
+        "If not specified, defaults to 2 for image-only CFG. "
+        "Use 1 for no guidance, 2 for image-only CFG (ViS2O), or 3 for dual guidance (text+image)."
         )
     parser.add_argument("--include-t5", action="store_true")
 

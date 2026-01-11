@@ -50,37 +50,40 @@ public protocol Scheduler {
 }
 
 @available(iOS 16.2, macOS 13.1, *)
-public extension Scheduler {
-    var initNoiseSigma: Float { 1 }
+extension Scheduler {
+    public var initNoiseSigma: Float { 1 }
 }
 
 @available(iOS 16.2, macOS 13.1, *)
-public extension Scheduler {
+extension Scheduler {
     /// Compute weighted sum of shaped arrays of equal shapes
     ///
     /// - Parameters:
     ///   - weights: The weights each array is multiplied by
     ///   - values: The arrays to be weighted and summed
     /// - Returns: sum_i weights[i]*values[i]
-    func weightedSum(_ weights: [Double], _ values: [MLShapedArray<Float32>]) -> MLShapedArray<Float32> {
+    public func weightedSum(_ weights: [Double], _ values: [MLShapedArray<Float32>])
+        -> MLShapedArray<Float32>
+    {
         let scalarCount = values.first!.scalarCount
         assert(weights.count > 1 && values.count == weights.count)
         assert(values.allSatisfy({ $0.scalarCount == scalarCount }))
 
         return MLShapedArray(unsafeUninitializedShape: values.first!.shape) { scalars, _ in
             scalars.initialize(repeating: 0.0)
-            for i in 0 ..< values.count {
+            for i in 0..<values.count {
                 let w = Float(weights[i])
                 values[i].withUnsafeShapedBufferPointer { buffer, _, _ in
                     assert(buffer.count == scalarCount)
                     // scalars[j] = w * values[i].scalars[j]
-                    cblas_saxpy(Int32(scalarCount), w, buffer.baseAddress, 1, scalars.baseAddress, 1)
+                    cblas_saxpy(
+                        Int32(scalarCount), w, buffer.baseAddress, 1, scalars.baseAddress, 1)
                 }
             }
         }
     }
-    
-    func addNoise(
+
+    public func addNoise(
         originalSample: MLShapedArray<Float32>,
         noise: [MLShapedArray<Float32>],
         strength: Float
@@ -90,7 +93,7 @@ public extension Scheduler {
         let betaProdt = 1 - alphaProdt
         let sqrtAlphaProdt = sqrt(alphaProdt)
         let sqrtBetaProdt = sqrt(betaProdt)
-        
+
         let noisySamples = noise.map {
             weightedSum(
                 [Double(sqrtAlphaProdt), Double(sqrtBetaProdt)],
@@ -105,8 +108,8 @@ public extension Scheduler {
 // MARK: - Timesteps
 
 @available(iOS 16.2, macOS 13.1, *)
-public extension Scheduler {
-    func calculateTimesteps(strength: Float?) -> [Int] {
+extension Scheduler {
+    public func calculateTimesteps(strength: Float?) -> [Int] {
         guard let strength else { return timeSteps }
         let startStep = max(inferenceStepCount - Int(Float(inferenceStepCount) * strength), 0)
         let actualTimesteps = Array(timeSteps[startStep...])
@@ -123,6 +126,15 @@ public enum BetaSchedule {
     case linear
     /// Steps using linspace(sqrt(start),sqrt(end))^2
     case scaledLinear
+}
+
+/// How to space timesteps for inference
+@available(iOS 16.2, macOS 13.1, *)
+public enum TimeStepSpacing {
+    case linspace
+    case leading
+    case trailing
+    case karras
 }
 
 // MARK: - PNDMScheduler
@@ -176,22 +188,26 @@ public final class PNDMScheduler: Scheduler {
         case .linear:
             self.betas = linspace(betaStart, betaEnd, trainStepCount)
         case .scaledLinear:
-            self.betas = linspace(pow(betaStart, 0.5), pow(betaEnd, 0.5), trainStepCount).map({ $0 * $0 })
+            self.betas = linspace(pow(betaStart, 0.5), pow(betaEnd, 0.5), trainStepCount).map({
+                $0 * $0
+            })
         }
         self.alphas = betas.map({ 1.0 - $0 })
         var alphasCumProd = self.alphas
         for i in 1..<alphasCumProd.count {
-            alphasCumProd[i] *= alphasCumProd[i -  1]
+            alphasCumProd[i] *= alphasCumProd[i - 1]
         }
         self.alphasCumProd = alphasCumProd
-        let stepsOffset = 1 // For stable diffusion
-        let stepRatio = Float(trainStepCount / stepCount )
+        let stepsOffset = 1  // For stable diffusion
+        let stepRatio = Float(trainStepCount / stepCount)
         let forwardSteps = (0..<stepCount).map {
             Int((Float($0) * stepRatio).rounded()) + stepsOffset
         }
 
         self.alpha_t = vForce.sqrt(self.alphasCumProd)
-        self.sigma_t = vForce.sqrt(vDSP.subtract([Float](repeating: 1, count: self.alphasCumProd.count), self.alphasCumProd))
+        self.sigma_t = vForce.sqrt(
+            vDSP.subtract(
+                [Float](repeating: 1, count: self.alphasCumProd.count), self.alphasCumProd))
         self.lambda_t = zip(self.alpha_t, self.sigma_t).map { α, σ in log(α) - log(σ) }
 
         var timeSteps: [Int] = []
@@ -220,7 +236,7 @@ public final class PNDMScheduler: Scheduler {
         timeStep t: Int,
         sample s: MLShapedArray<Float32>
     ) -> MLShapedArray<Float32> {
-        
+
         var timeStep = t
         let stepInc = (trainStepCount / inferenceStepCount)
         var prevStep = timeStep - stepInc
@@ -242,29 +258,30 @@ public final class PNDMScheduler: Scheduler {
             currentSample = sample
         } else if ets.count == 1 && counter == 1 {
             modelOutput = weightedSum(
-                [1.0/2.0, 1.0/2.0],
-                [output,  ets[back: 1]]
+                [1.0 / 2.0, 1.0 / 2.0],
+                [output, ets[back: 1]]
             )
             sample = currentSample!
             currentSample = nil
         } else if ets.count == 2 {
             modelOutput = weightedSum(
-                [3.0/2.0,      -1.0/2.0],
+                [3.0 / 2.0, -1.0 / 2.0],
                 [ets[back: 1], ets[back: 2]]
             )
         } else if ets.count == 3 {
             modelOutput = weightedSum(
-                [23.0/12.0,    -16.0/12.0,   5.0/12.0],
+                [23.0 / 12.0, -16.0 / 12.0, 5.0 / 12.0],
                 [ets[back: 1], ets[back: 2], ets[back: 3]]
             )
         } else {
             modelOutput = weightedSum(
-                [55.0/24.0,    -59.0/24.0,   37/24.0,      -9/24.0],
+                [55.0 / 24.0, -59.0 / 24.0, 37 / 24.0, -9 / 24.0],
                 [ets[back: 1], ets[back: 2], ets[back: 3], ets[back: 4]]
             )
         }
 
-        let convertedOutput = convertModelOutput(modelOutput: modelOutput, timestep: timeStep, sample: sample)
+        let convertedOutput = convertModelOutput(
+            modelOutput: modelOutput, timestep: timeStep, sample: sample)
         modelOutputs.append(convertedOutput)
 
         let prevSample = previousSample(sample, timeStep, prevStep, modelOutput)
@@ -274,7 +291,9 @@ public final class PNDMScheduler: Scheduler {
     }
 
     /// Convert the model output to the corresponding type the algorithm needs.
-    func convertModelOutput(modelOutput: MLShapedArray<Float32>, timestep: Int, sample: MLShapedArray<Float32>) -> MLShapedArray<Float32> {
+    func convertModelOutput(
+        modelOutput: MLShapedArray<Float32>, timestep: Int, sample: MLShapedArray<Float32>
+    ) -> MLShapedArray<Float32> {
         assert(modelOutput.scalarCount == sample.scalarCount)
         let scalarCount = modelOutput.scalarCount
         let (alpha_t, sigma_t) = (self.alpha_t[timestep], self.sigma_t[timestep])
@@ -283,8 +302,9 @@ public final class PNDMScheduler: Scheduler {
             assert(scalars.count == scalarCount)
             modelOutput.withUnsafeShapedBufferPointer { modelOutput, _, _ in
                 sample.withUnsafeShapedBufferPointer { sample, _, _ in
-                    for i in 0 ..< scalarCount {
-                        scalars.initializeElement(at: i, to: (sample[i] - modelOutput[i] * sigma_t) / alpha_t)
+                    for i in 0..<scalarCount {
+                        scalars.initializeElement(
+                            at: i, to: (sample[i] - modelOutput[i] * sigma_t) / alpha_t)
                     }
                 }
             }
@@ -304,7 +324,7 @@ public final class PNDMScheduler: Scheduler {
         _ timeStep: Int,
         _ prevStep: Int,
         _ modelOutput: MLShapedArray<Float32>
-    ) ->  MLShapedArray<Float32> {
+    ) -> MLShapedArray<Float32> {
 
         // Compute x_(t−δ) using formula (9) from
         // "Pseudo Numerical Methods for Diffusion Models on Manifolds",
@@ -318,7 +338,7 @@ public final class PNDMScheduler: Scheduler {
         // betaProdt        (1 - α_t)
         // betaProdtPrev    (1 - α_(t−δ))
         let alphaProdt = alphasCumProd[timeStep]
-        let alphaProdtPrev = alphasCumProd[max(0,prevStep)]
+        let alphaProdtPrev = alphasCumProd[max(0, prevStep)]
         let betaProdt = 1 - alphaProdt
         let betaProdtPrev = 1 - alphaProdtPrev
 
@@ -329,11 +349,12 @@ public final class PNDMScheduler: Scheduler {
         let sampleCoeff = sqrt(alphaProdtPrev / alphaProdt)
 
         // Denominator of e_θ(x_t, t) in formula (9)
-        let modelOutputDenomCoeff = alphaProdt * sqrt(betaProdtPrev)
-        + sqrt(alphaProdt * betaProdt * alphaProdtPrev)
+        let modelOutputDenomCoeff =
+            alphaProdt * sqrt(betaProdtPrev)
+            + sqrt(alphaProdt * betaProdt * alphaProdtPrev)
 
         // full formula (9)
-        let modelCoeff = -(alphaProdtPrev - alphaProdt)/modelOutputDenomCoeff
+        let modelCoeff = -(alphaProdtPrev - alphaProdt) / modelOutputDenomCoeff
         let prevSample = weightedSum(
             [Double(sampleCoeff), Double(modelCoeff)],
             [sample, modelOutput]
@@ -352,7 +373,7 @@ public final class PNDMScheduler: Scheduler {
 /// - Returns: Float array with *count* elements evenly spaced between at *start* and *end*
 func linspace(_ start: Float, _ end: Float, _ count: Int) -> [Float] {
     let scale = (end - start) / Float(count - 1)
-    return (0..<count).map { Float($0)*scale + start }
+    return (0..<count).map { Float($0) * scale + start }
 }
 
 extension Collection {

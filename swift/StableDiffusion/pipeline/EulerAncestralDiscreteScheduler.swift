@@ -111,17 +111,45 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
 
         self.alphasCumProd = alphasCumProd
 
-        // Compute sigmas from alphas_cumprod: sigma = sqrt((1 - alpha_cumprod) / alpha_cumprod)
-        var sigmas = alphasCumProd.map { alpha -> Float in
-            sqrt((1 - alpha) / alpha)
+        // Compute timesteps for inference based on spacing
+        let timesteps: [Float]
+        switch timestepSpacing {
+        case .linspace:
+            timesteps = linspace(0, Float(trainStepCount - 1), stepCount).reversed()
+        case .leading:
+            let stepRatio = trainStepCount / stepCount
+            timesteps = (0..<stepCount).map { Float($0 * stepRatio) }.reversed()
+        case .trailing:
+            let stepRatio = Float(trainStepCount) / Float(stepCount)
+            var trailingTimesteps: [Float] = []
+            var t = Float(trainStepCount)
+            while trailingTimesteps.count < stepCount {
+                trailingTimesteps.append(round(t) - 1)
+                t -= stepRatio
+            }
+            timesteps = trailingTimesteps
+        case .karras:
+            // Karras spacing not yet implemented, default to linspace
+            timesteps = linspace(0, Float(trainStepCount - 1), stepCount).reversed()
         }
-        // Reverse sigmas and append 0
-        sigmas = sigmas.reversed() + [0.0]
-        self.sigmas = sigmas
 
-        // Initialize timesteps for full schedule
-        let timesteps = linspace(0, Float(trainStepCount - 1), trainStepCount).reversed().map { Int($0) }
-        self.timeSteps = timesteps
+        self.timeSteps = timesteps.map { Int(round($0)) }
+
+        // Compute sigmas for the selected inference timesteps
+        let sigmasAll = Array(alphasCumProd.map { alpha -> Float in
+            sqrt((1 - alpha) / alpha)
+        }.reversed())
+
+        // Interpolate sigmas for the inference timesteps
+        var inferenceSigmas: [Float] = []
+        for timestep in timesteps {
+            let idx = Int(timestep)
+            if idx < sigmasAll.count {
+                inferenceSigmas.append(sigmasAll[idx])
+            }
+        }
+        inferenceSigmas.append(0.0)  // Append final sigma
+        self.sigmas = inferenceSigmas
 
         self.stepIndex = nil
     }
@@ -156,55 +184,6 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
         let newBetas = newAlphas.map { 1.0 - $0 }
 
         return newBetas
-    }
-
-    /// Set the discrete timesteps used for the diffusion chain
-    ///
-    /// - Parameter numInferenceSteps: Number of diffusion steps for generation
-    public func setTimesteps(numInferenceSteps: Int) {
-        let timesteps: [Float]
-
-        switch timestepSpacing {
-        case .linspace:
-            timesteps = linspace(0, Float(trainStepCount - 1), numInferenceSteps).reversed()
-        case .leading:
-            let stepRatio = trainStepCount / numInferenceSteps
-            // Creates integer timesteps by multiplying by ratio
-            timesteps = (0..<numInferenceSteps).map { Float($0 * stepRatio) }.reversed()
-        case .trailing:
-            let stepRatio = Float(trainStepCount) / Float(numInferenceSteps)
-            // Creates integer timesteps by multiplying by ratio
-            var trailingTimesteps: [Float] = []
-            var t = Float(trainStepCount)
-            while t > 0 {
-                trailingTimesteps.append(round(t) - 1)
-                t -= stepRatio
-            }
-            timesteps = trailingTimesteps
-        case .karras:
-            // Karras spacing not yet implemented for EulerAncestral, default to linspace
-            timesteps = linspace(0, Float(trainStepCount - 1), numInferenceSteps).reversed()
-        }
-
-        self.timeSteps = timesteps.map { Int(round($0)) }
-
-        // Recompute sigmas for the new timestep schedule
-        let sigmasAll = alphasCumProd.map { alpha -> Float in
-            sqrt((1 - alpha) / alpha)
-        }
-
-        // Interpolate sigmas for the selected timesteps
-        var newSigmas: [Float] = []
-        for timestep in timesteps {
-            let idx = Int(timestep)
-            if idx < sigmasAll.count {
-                newSigmas.append(sigmasAll[sigmasAll.count - 1 - idx])
-            }
-        }
-        newSigmas.append(0.0)
-        self.sigmas = newSigmas
-
-        self.stepIndex = nil
     }
 
     /// Find the index of a given timestep in the timestep schedule

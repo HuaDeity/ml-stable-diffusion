@@ -29,9 +29,11 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
     public let alphas: [Float]
     public let alphasCumProd: [Float]
     public var timeSteps: [Int]
+    private var timesteps: [Float]
 
     public let predictionType: PredictionType
     public let timestepSpacing: TimeStepSpacing
+    private let stepsOffset: Int
 
     public private(set) var modelOutputs: [MLShapedArray<Float32>] = []
 
@@ -44,10 +46,10 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
 
     /// Standard deviation of the initial noise distribution
     public var initNoiseSigma: Float {
-        if timestepSpacing == .linspace {
+        if timestepSpacing == .linspace || timestepSpacing == .trailing {
             return sigmas.max() ?? 1.0
         }
-        // For leading/trailing spacing
+        
         let maxSigma = sigmas.max() ?? 1.0
         return sqrt(maxSigma * maxSigma + 1)
     }
@@ -72,12 +74,14 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
         betaEnd: Float = 0.012,
         predictionType: PredictionType = .epsilon,
         timestepSpacing: TimeStepSpacing = .linspace,
-        rescaleBetasZeroSnr: Bool = false
+        rescaleBetasZeroSnr: Bool = false,
+        stepsOffset: Int = 0
     ) {
         self.trainStepCount = trainStepCount
         self.inferenceStepCount = stepCount
         self.predictionType = predictionType
         self.timestepSpacing = timestepSpacing
+        self.stepsOffset = stepsOffset
 
         // Initialize betas based on schedule
         var betas: [Float]
@@ -118,7 +122,10 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
             timesteps = linspace(0, Float(trainStepCount - 1), stepCount).reversed()
         case .leading:
             let stepRatio = trainStepCount / stepCount
-            timesteps = (0..<stepCount).map { Float($0 * stepRatio) }.reversed()
+            timesteps = (0..<stepCount)
+                .map { Float($0 * stepRatio) }
+                .reversed()
+                .map { $0 + Float(stepsOffset) }
         case .trailing:
             let stepRatio = Float(trainStepCount) / Float(stepCount)
             var trailingTimesteps: [Float] = []
@@ -133,21 +140,17 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
             timesteps = linspace(0, Float(trainStepCount - 1), stepCount).reversed()
         }
 
+        self.timesteps = timesteps
         self.timeSteps = timesteps.map { Int(round($0)) }
 
         // Compute sigmas for the selected inference timesteps
-        let sigmasAll = Array(alphasCumProd.map { alpha -> Float in
+        // sigmas[i] = sqrt((1 - alpha_cumprod[i]) / alpha_cumprod[i])
+        let sigmasAll = alphasCumProd.map { alpha -> Float in
             sqrt((1 - alpha) / alpha)
-        }.reversed())
+        }
 
         // Interpolate sigmas for the inference timesteps
-        var inferenceSigmas: [Float] = []
-        for timestep in timesteps {
-            let idx = Int(timestep)
-            if idx < sigmasAll.count {
-                inferenceSigmas.append(sigmasAll[idx])
-            }
-        }
+        var inferenceSigmas = timesteps.map { Self.interpolateSigma(sigmasAll, at: $0) }
         inferenceSigmas.append(0.0)  // Append final sigma
         self.sigmas = inferenceSigmas
 
@@ -184,6 +187,25 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
         let newBetas = newAlphas.map { 1.0 - $0 }
 
         return newBetas
+    }
+
+    /// Linearly interpolate sigmas at a fractional timestep
+    private static func interpolateSigma(_ sigmas: [Float], at timestep: Float) -> Float {
+        if timestep <= 0 {
+            return sigmas.first ?? 0
+        }
+
+        let maxIndex = sigmas.count - 1
+        if timestep >= Float(maxIndex) {
+            return sigmas.last ?? 0
+        }
+
+        let lowIndex = Int(floor(timestep))
+        let highIndex = min(lowIndex + 1, maxIndex)
+        let weight = timestep - Float(lowIndex)
+        let low = sigmas[lowIndex]
+        let high = sigmas[highIndex]
+        return low * (1 - weight) + high * weight
     }
 
     /// Find the index of a given timestep in the timestep schedule
@@ -228,6 +250,21 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
                     scalars.initializeElement(at: i, to: buffer[i] * scale)
                 }
             }
+        }
+    }
+
+    public func addNoise(
+        originalSample: MLShapedArray<Float32>,
+        noise: [MLShapedArray<Float32>],
+        strength: Float
+    ) -> [MLShapedArray<Float32>] {
+        let startStep = max(inferenceStepCount - Int(Float(inferenceStepCount) * strength), 0)
+        let sigma = sigmas[startStep]
+        return noise.map {
+            weightedSum(
+                [1.0, Double(sigma)],
+                [originalSample, $0]
+            )
         }
     }
 
@@ -281,7 +318,7 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
                 }
             }
         case .sample:
-            predOriginalSample = output
+            preconditionFailure("predictionType .sample is not supported for EulerAncestralDiscreteScheduler.")
         }
 
         // Store the predicted original sample
@@ -289,7 +326,7 @@ public final class EulerAncestralDiscreteScheduler: Scheduler {
 
         // 2. Compute sigma_from, sigma_to, sigma_up, sigma_down
         let sigmaFrom = sigmas[stepIndex!]
-        let sigmaTo = stepIndex! + 1 < sigmas.count ? sigmas[stepIndex! + 1] : 0
+        let sigmaTo = sigmas[stepIndex! + 1]
 
         // sigma_up = sqrt(sigma_to^2 * (sigma_from^2 - sigma_to^2) / sigma_from^2)
         let sigmaUp = sqrt(sigmaTo * sigmaTo * (sigmaFrom * sigmaFrom - sigmaTo * sigmaTo) / (sigmaFrom * sigmaFrom))

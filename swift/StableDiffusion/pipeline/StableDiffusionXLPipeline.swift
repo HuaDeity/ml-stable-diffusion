@@ -208,9 +208,13 @@ public struct StableDiffusionXLPipeline: StableDiffusionPipelineProtocol {
 
         // De-noising loop
         for (step,t) in timeSteps.enumerated() {
+            let scaledLatents = zip(latents, scheduler).map { latent, scheduler in
+                scheduler.scaleModelInput(sample: latent, timestep: t)
+            }
+
             // Expand the latents for classifier-free guidance
             // and input to the Unet noise prediction model
-            let latentUnetInput = latents.map {
+            let latentUnetInput = scaledLatents.map {
                 MLShapedArray<Float32>(concatenating: [$0, $0], alongAxis: 0)
             }
 

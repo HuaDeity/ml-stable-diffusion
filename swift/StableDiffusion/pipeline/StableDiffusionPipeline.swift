@@ -324,15 +324,19 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         let timeSteps: [Int] = scheduler[0].calculateTimesteps(strength: timestepStrength)
         for (step, t) in timeSteps.enumerated() {
 
+            let scaledLatents = zip(latents, scheduler).map { latent, scheduler in
+                scheduler.scaleModelInput(sample: latent, timestep: t)
+            }
+
             // Expand the latents for classifier-free guidance
             // and input to the Unet noise prediction model
             var latentUnetInput: [MLShapedArray<Float32>]
             if config.guidanceScale >= 1.0 || useDualImageGuidance {
-                latentUnetInput = latents.map {
+                latentUnetInput = scaledLatents.map {
                     MLShapedArray<Float32>(concatenating: [$0, $0], alongAxis: 0)
                 }
             } else {
-                latentUnetInput = latents
+                latentUnetInput = scaledLatents
             }
 
             // For ViS2O 8-channel mode: concatenate image latents with noise latents
@@ -388,7 +392,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                 var hidden0 = MLShapedArray<Float32>(converting: hiddenStates[0])
                 hidden0 = MLShapedArray(scalars: hidden0.scalars, shape: [1] + hidden0.shape)
                 let noise_pred_uncond = try unet.predictNoise(
-                    latents: latents,
+                    latents: scaledLatents,
                     timeStep: t,
                     hiddenStates: hidden0,
                     additionalResiduals: additionalResiduals
@@ -397,7 +401,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                 var hidden1 = MLShapedArray<Float32>(converting: hiddenStates[1])
                 hidden1 = MLShapedArray(scalars: hidden1.scalars, shape: [1] + hidden1.shape)
                 let noise_pred_text = try unet.predictNoise(
-                    latents: latents,
+                    latents: scaledLatents,
                     timeStep: t,
                     hiddenStates: hidden1,
                     additionalResiduals: additionalResiduals

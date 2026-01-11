@@ -33,6 +33,30 @@ public protocol Scheduler {
     /// Denoised latents
     var modelOutputs: [MLShapedArray<Float32>] { get }
 
+    /// Scale the model input for a given timestep, if required by the scheduler
+    ///
+    /// - Parameters:
+    ///   - sample: The input sample to scale
+    ///   - timestep: The current timestep
+    /// - Returns: The scaled input sample
+    func scaleModelInput(
+        sample: MLShapedArray<Float32>,
+        timestep: Int
+    ) -> MLShapedArray<Float32>
+
+    /// Add noise to the original sample for the given strength
+    ///
+    /// - Parameters:
+    ///   - originalSample: The original sample
+    ///   - noise: Noise samples to add
+    ///   - strength: Strength for noise addition
+    /// - Returns: Noisy samples
+    func addNoise(
+        originalSample: MLShapedArray<Float32>,
+        noise: [MLShapedArray<Float32>],
+        strength: Float
+    ) -> [MLShapedArray<Float32>]
+
     /// Compute a de-noised image sample and step scheduler state
     ///
     /// - Parameters:
@@ -56,6 +80,20 @@ extension Scheduler {
 
 @available(iOS 16.2, macOS 13.1, *)
 extension Scheduler {
+    public func scaleModelInput(
+        sample: MLShapedArray<Float32>,
+        timestep: Int
+    ) -> MLShapedArray<Float32> {
+        sample
+    }
+
+    public func scaleModelInput(
+        sample: MLShapedArray<Float32>,
+        timestep: Float
+    ) -> MLShapedArray<Float32> {
+        scaleModelInput(sample: sample, timestep: Int(round(timestep)))
+    }
+
     /// Compute weighted sum of shaped arrays of equal shapes
     ///
     /// - Parameters:

@@ -59,10 +59,25 @@ class Einsum(nn.Module):
             return attention.split_einsum_v2(q, k, v, mask, self.heads, self.dim_head)
 
 
+class InstanceProcessor(nn.Module):
+    def __init__(self, query_dim, instance_rep_dim):
+        super().__init__()
+        self.q_norm = nn.LayerNorm(instance_rep_dim)
+        self.q_proj = nn.Linear(instance_rep_dim, query_dim, bias=False)
+
+
 class CrossAttention(nn.Module):
-    """ Apple Silicon friendly version of `diffusers.models.attention.CrossAttention`
-    """
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64):
+    """ Apple Silicon friendly version of `diffusers.models.attention.CrossAttention` """
+
+    def __init__(
+        self,
+        query_dim,
+        context_dim=None,
+        heads=8,
+        dim_head=64,
+        instance_rep_dim=None,
+        add_instance_processor=False,
+    ):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = context_dim if context_dim is not None else query_dim
@@ -83,12 +98,80 @@ class CrossAttention(nn.Module):
         self.to_out = nn.Sequential(
             nn.Conv2d(inner_dim, query_dim, kernel_size=1, bias=True))
         self.einsum = Einsum(self.heads, self.dim_head)
+        if add_instance_processor:
+            if instance_rep_dim is None:
+                raise ValueError("instance_rep_dim must be set when add_instance_processor is True")
+            self.processor = InstanceProcessor(query_dim, instance_rep_dim)
+        else:
+            self.processor = None
 
-    def forward(self, hidden_states, context=None, mask=None):
+    def _build_asymmetric_mask(self, instance_masks, height, width, dtype):
+        if instance_masks.shape[-2:] != (height, width):
+            instance_masks = F.interpolate(instance_masks, size=(height, width), mode="nearest")
+
+        flat_masks = instance_masks.view(instance_masks.shape[0], instance_masks.shape[1], height * width)
+
+        mask_sum = flat_masks.sum(dim=1)
+        is_background = mask_sum == 0
+
+        m_same = torch.einsum("bni,bnj->bij", flat_masks, flat_masks)
+        m_same = (m_same > 0).to(dtype)
+
+        bg_rows = is_background.unsqueeze(2).expand_as(m_same)
+        m_pp = torch.where(bg_rows, torch.ones_like(m_same, dtype=dtype), m_same)
+
+        m_pi = (flat_masks.transpose(1, 2) > 0).to(dtype)
+        bg_to_inst = is_background.unsqueeze(2).expand_as(m_pi)
+        m_pi = torch.where(bg_to_inst, torch.ones_like(m_pi, dtype=dtype), m_pi)
+
+        m_ip = (flat_masks > 0).to(dtype)
+        m_ii = torch.ones(
+            (flat_masks.shape[0], flat_masks.shape[1], flat_masks.shape[1]),
+            device=flat_masks.device,
+            dtype=dtype,
+        )
+
+        top = torch.cat([m_pp, m_pi], dim=2)
+        bottom = torch.cat([m_ip, m_ii], dim=2)
+        full_mask = torch.cat([top, bottom], dim=1)
+
+        attention_mask = (1.0 - full_mask) * -10000.0
+        return attention_mask.unsqueeze(2)
+
+    def forward(
+        self,
+        hidden_states,
+        context=None,
+        mask=None,
+        instance_representation=None,
+        instance_masks=None,
+        height=None,
+        width=None,
+    ):
         # if self.training:
         #     raise NotImplementedError(WARN_MSG)
 
         batch_size, dim, _, sequence_length = hidden_states.shape
+
+        if self.processor is not None and instance_representation is not None and instance_masks is not None:
+            if height is None or width is None:
+                height, width = instance_masks.shape[-2:]
+
+            inst_rep = self.processor.q_norm(instance_representation)
+            inst_rep = self.processor.q_proj(inst_rep)
+            inst_rep = inst_rep.transpose(1, 2).unsqueeze(2)
+
+            unified = torch.cat([hidden_states, inst_rep], dim=3)
+
+            q = self.to_q(unified)
+            k = self.to_k(unified)
+            v = self.to_v(unified)
+
+            attn_mask = self._build_asymmetric_mask(instance_masks, height, width, q.dtype)
+            attn = self.einsum(q, k, v, attn_mask)
+
+            attn = attn[..., :sequence_length]
+            return self.to_out(attn)
 
         q = self.to_q(hidden_states)
         context = context if context is not None else hidden_states
@@ -124,6 +207,8 @@ def linear_to_conv2d_map(state_dict, prefix, local_metadata, strict,
     """
     for k in state_dict:
         if 'weight' in k and len(state_dict[k].shape) == 2:
+            if ".processor." in k:
+                continue
             state_dict[k] = state_dict[k][:, :, None, None]
 
 # Note: torch.nn.LayerNorm and ane_transformers.reference.layer_norm.LayerNormANE
@@ -168,6 +253,8 @@ class CrossAttnUpBlock2D(nn.Module):
         downsample_padding=1,
         add_upsample=True,
         transformer_layers_per_block=1,
+        instance_rep_dim=None,
+        enable_instance_attn=False,
     ):
         super().__init__()
         resnets = []
@@ -197,6 +284,8 @@ class CrossAttnUpBlock2D(nn.Module):
                     out_channels // attn_num_head_channels,
                     depth=transformer_layers_per_block,
                     context_dim=cross_attention_dim,
+                    instance_rep_dim=instance_rep_dim,
+                    enable_instance_attn=enable_instance_attn,
                 ))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
@@ -204,11 +293,15 @@ class CrossAttnUpBlock2D(nn.Module):
         if add_upsample:
             self.upsamplers = nn.ModuleList([Upsample2D(out_channels)])
 
-    def forward(self,
-                hidden_states,
-                res_hidden_states_tuple,
-                temb=None,
-                encoder_hidden_states=None):
+    def forward(
+        self,
+        hidden_states,
+        res_hidden_states_tuple,
+        temb=None,
+        encoder_hidden_states=None,
+        instance_representation=None,
+        instance_masks=None,
+    ):
         for resnet, attn in zip(self.resnets, self.attentions):
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
@@ -216,7 +309,12 @@ class CrossAttnUpBlock2D(nn.Module):
                                       dim=1)
 
             hidden_states = resnet(hidden_states, temb)
-            hidden_states = attn(hidden_states, context=encoder_hidden_states)
+            hidden_states = attn(
+                hidden_states,
+                context=encoder_hidden_states,
+                instance_representation=instance_representation,
+                instance_masks=instance_masks,
+            )
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
@@ -298,6 +396,8 @@ class CrossAttnDownBlock2D(nn.Module):
         output_scale_factor=1.0,
         downsample_padding=1,
         add_downsample=True,
+        instance_rep_dim=None,
+        enable_instance_attn=False,
     ):
         super().__init__()
         resnets = []
@@ -324,6 +424,8 @@ class CrossAttnDownBlock2D(nn.Module):
                     out_channels // attn_num_head_channels,
                     depth=transformer_layers_per_block,
                     context_dim=cross_attention_dim,
+                    instance_rep_dim=instance_rep_dim,
+                    enable_instance_attn=enable_instance_attn,
                 ))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
@@ -333,12 +435,24 @@ class CrossAttnDownBlock2D(nn.Module):
         else:
             self.downsamplers = None
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None):
+    def forward(
+        self,
+        hidden_states,
+        temb=None,
+        encoder_hidden_states=None,
+        instance_representation=None,
+        instance_masks=None,
+    ):
         output_states = ()
 
         for resnet, attn in zip(self.resnets, self.attentions):
             hidden_states = resnet(hidden_states, temb)
-            hidden_states = attn(hidden_states, context=encoder_hidden_states)
+            hidden_states = attn(
+                hidden_states,
+                context=encoder_hidden_states,
+                instance_representation=instance_representation,
+                instance_masks=instance_masks,
+            )
             output_states += (hidden_states, )
 
         if self.downsamplers is not None:
@@ -519,6 +633,8 @@ class SpatialTransformer(nn.Module):
         d_head,
         depth=1,
         context_dim=None,
+        instance_rep_dim=None,
+        enable_instance_attn=False,
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -540,7 +656,9 @@ class SpatialTransformer(nn.Module):
             BasicTransformerBlock(inner_dim,
                                   n_heads,
                                   d_head,
-                                  context_dim=context_dim)
+                                  context_dim=context_dim,
+                                  instance_rep_dim=instance_rep_dim,
+                                  enable_instance_attn=enable_instance_attn)
             for d in range(depth)
         ])
 
@@ -550,14 +668,21 @@ class SpatialTransformer(nn.Module):
                                   stride=1,
                                   padding=0)
 
-    def forward(self, hidden_states, context=None):
+    def forward(self, hidden_states, context=None, instance_representation=None, instance_masks=None):
         batch, channel, height, weight = hidden_states.shape
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         hidden_states = self.proj_in(hidden_states)
         hidden_states = hidden_states.view(batch, channel, 1, height * weight)
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, context=context)
+            hidden_states = block(
+                hidden_states,
+                context=context,
+                instance_representation=instance_representation,
+                instance_masks=instance_masks,
+                height=height,
+                width=weight,
+            )
         hidden_states = hidden_states.view(batch, channel, height, weight)
         hidden_states = self.proj_out(hidden_states)
         return hidden_states + residual
@@ -565,12 +690,23 @@ class SpatialTransformer(nn.Module):
 
 class BasicTransformerBlock(nn.Module):
 
-    def __init__(self, dim, n_heads, d_head, context_dim=None, gated_ff=True):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        d_head,
+        context_dim=None,
+        gated_ff=True,
+        instance_rep_dim=None,
+        enable_instance_attn=False,
+    ):
         super().__init__()
         self.attn1 = CrossAttention(
             query_dim=dim,
             heads=n_heads,
             dim_head=d_head,
+            instance_rep_dim=instance_rep_dim,
+            add_instance_processor=enable_instance_attn,
         )
         self.ff = FeedForward(dim, glu=gated_ff)
         self.attn2 = CrossAttention(
@@ -583,8 +719,25 @@ class BasicTransformerBlock(nn.Module):
         self.norm2 = LayerNormANE(dim)
         self.norm3 = LayerNormANE(dim)
 
-    def forward(self, hidden_states, context=None):
-        hidden_states = self.attn1(self.norm1(hidden_states)) + hidden_states
+    def forward(
+        self,
+        hidden_states,
+        context=None,
+        instance_representation=None,
+        instance_masks=None,
+        height=None,
+        width=None,
+    ):
+        hidden_states = (
+            self.attn1(
+                self.norm1(hidden_states),
+                instance_representation=instance_representation,
+                instance_masks=instance_masks,
+                height=height,
+                width=width,
+            )
+            + hidden_states
+        )
         hidden_states = self.attn2(self.norm2(hidden_states),
                                    context=context) + hidden_states
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
@@ -743,6 +896,8 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         attention_type="default",
         cross_attention_dim=768,
         transformer_layers_per_block=1,
+        instance_rep_dim=None,
+        enable_instance_attn=False,
         **kwargs,
     ):
         super().__init__()
@@ -772,6 +927,8 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                     in_channels // attn_num_head_channels,
                     depth=transformer_layers_per_block,
                     context_dim=cross_attention_dim,
+                    instance_rep_dim=instance_rep_dim,
+                    enable_instance_attn=enable_instance_attn,
                 ))
             resnets.append(
                 ResnetBlock2D(
@@ -786,10 +943,22 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None):
+    def forward(
+        self,
+        hidden_states,
+        temb=None,
+        encoder_hidden_states=None,
+        instance_representation=None,
+        instance_masks=None,
+    ):
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
-            hidden_states = attn(hidden_states, encoder_hidden_states)
+            hidden_states = attn(
+                hidden_states,
+                encoder_hidden_states,
+                instance_representation=instance_representation,
+                instance_masks=instance_masks,
+            )
             hidden_states = resnet(hidden_states, temb)
 
         return hidden_states
@@ -830,6 +999,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
         addition_time_embed_dim=None,
         projection_class_embeddings_input_dim=None,
         support_controlnet=False,
+        instance_rep_dim=None,
+        enable_instance_attn=False,
         **kwargs,
     ):
         if kwargs.get("dual_cross_attention", None):
@@ -912,6 +1083,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
                 attn_num_head_channels=attention_head_dim[i],
                 downsample_padding=downsample_padding,
                 add_downsample=not is_final_block,
+                instance_rep_dim=instance_rep_dim,
+                enable_instance_attn=enable_instance_attn,
             )
             self.down_blocks.append(down_block)
 
@@ -928,6 +1101,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attention_head_dim[i],
             resnet_groups=norm_num_groups,
+            instance_rep_dim=instance_rep_dim,
+            enable_instance_attn=enable_instance_attn,
         )
 
         # up
@@ -958,6 +1133,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
                 resnet_act_fn=act_fn,
                 cross_attention_dim=cross_attention_dim,
                 attn_num_head_channels=reversed_attention_head_dim[i],
+                instance_rep_dim=instance_rep_dim,
+                enable_instance_attn=enable_instance_attn,
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
@@ -977,6 +1154,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
         sample,
         timestep,
         encoder_hidden_states,
+        instance_representation=None,
+        instance_masks=None,
         *additional_residuals,
     ):
         # 0. Project (or look-up) time embeddings
@@ -999,7 +1178,10 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
                 sample, res_samples = downsample_block(
                     hidden_states=sample,
                     temb=emb,
-                    encoder_hidden_states=encoder_hidden_states)
+                    encoder_hidden_states=encoder_hidden_states,
+                    instance_representation=instance_representation,
+                    instance_masks=instance_masks,
+                )
             else:
                 sample, res_samples = downsample_block(hidden_states=sample,
                                                        temb=emb)
@@ -1014,9 +1196,13 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
             down_block_res_samples = new_down_block_res_samples
 
         # 4. mid
-        sample = self.mid_block(sample,
-                                emb,
-                                encoder_hidden_states=encoder_hidden_states)
+        sample = self.mid_block(
+            sample,
+            emb,
+            encoder_hidden_states=encoder_hidden_states,
+            instance_representation=instance_representation,
+            instance_masks=instance_masks,
+        )
 
         if self.support_controlnet:
             sample = sample + additional_residuals[-1]
@@ -1034,6 +1220,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
                     temb=emb,
                     res_hidden_states_tuple=res_samples,
                     encoder_hidden_states=encoder_hidden_states,
+                    instance_representation=instance_representation,
+                    instance_masks=instance_masks,
                 )
             else:
                 sample = upsample_block(hidden_states=sample,
@@ -1165,6 +1353,8 @@ def get_down_block(
     cross_attention_dim=None,
     downsample_padding=None,
     add_downsample=True,
+    instance_rep_dim=None,
+    enable_instance_attn=False,
 ):
     down_block_type = down_block_type[7:] if down_block_type.startswith(
         "UNetRes") else down_block_type
@@ -1195,6 +1385,8 @@ def get_down_block(
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
             add_downsample=add_downsample,
+            instance_rep_dim=instance_rep_dim,
+            enable_instance_attn=enable_instance_attn,
         )
 
 
@@ -1211,6 +1403,8 @@ def get_up_block(
     attn_num_head_channels,
     transformer_layers_per_block=1,
     cross_attention_dim=None,
+    instance_rep_dim=None,
+    enable_instance_attn=False,
 ):
     up_block_type = up_block_type[7:] if up_block_type.startswith(
         "UNetRes") else up_block_type
@@ -1241,6 +1435,8 @@ def get_up_block(
             cross_attention_dim=cross_attention_dim,
             attn_num_head_channels=attn_num_head_channels,
             transformer_layers_per_block=transformer_layers_per_block,
+            instance_rep_dim=instance_rep_dim,
+            enable_instance_attn=enable_instance_attn,
         )
     raise ValueError(f"{up_block_type} does not exist.")
 

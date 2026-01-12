@@ -77,10 +77,25 @@ struct StableDiffusionSample: ParsableCommand {
     @Flag(help: "Enable 8-channel UNet mode for ViS2O (concatenate image latents with noise latents)")
     var use8ChannelUNet: Bool = false
 
+    @Flag(help: "Enable ViS2O mask pipeline (instance-conditioned generation)")
+    var useMaskPipeline: Bool = false
+
+    @Option(
+        parsing: .upToNextOption,
+        help: "Paths to per-instance binary mask images (one per class)"
+    )
+    var instanceMasks: [String] = []
+
+    @Option(
+        parsing: .upToNextOption,
+        help: "Texts for each instance mask (same order as --instance-masks)"
+    )
+    var instanceTexts: [String] = []
+
     @Option(help: "Compute units to load model with {all,cpuOnly,cpuAndGPU,cpuAndNeuralEngine}")
     var computeUnits: ComputeUnits = .all
 
-    @Option(help: "Scheduler to use, one of {pndm, dpmpp}")
+    @Option(help: "Scheduler to use, one of {pndm, dpmpp, euler}")
     var scheduler: SchedulerOption = .pndm
 
     @Option(help: "Random number generator to use, one of {numpy, torch, nvidia}")
@@ -189,6 +204,7 @@ struct StableDiffusionSample: ParsableCommand {
         } else {
             startingImage = nil
         }
+
         
         // convert image for ControlNet into CGImage when controlNet available
         let controlNetInputs: [CGImage]
@@ -205,9 +221,63 @@ struct StableDiffusionSample: ParsableCommand {
             controlNetInputs = []
         }
 
+        let shouldUseMaskPipeline = useMaskPipeline || !instanceMasks.isEmpty
+
         log("Sampling ...\n")
         let sampleTimer = SampleTimer()
         sampleTimer.start()
+
+        if shouldUseMaskPipeline {
+            if instanceMasks.count != instanceTexts.count {
+                throw RunError.resources(
+                    "Instance masks count (\(instanceMasks.count)) must match instance texts count (\(instanceTexts.count))"
+                )
+            }
+            guard let startingImage else {
+                throw RunError.resources("Mask pipeline requires --image")
+            }
+
+            let maskImages = try instanceMasks.map { maskPath in
+                let maskURL = URL(filePath: maskPath)
+                return try convertImageToCGImage(imageURL: maskURL)
+            }
+
+            var maskConfig = ViS2OMaskPipeline.Configuration(
+                prompt: prompt,
+                startingImage: startingImage,
+                instanceMasks: maskImages,
+                instanceTexts: instanceTexts
+            )
+            maskConfig.stepCount = stepCount
+            maskConfig.seed = seed
+            maskConfig.guidanceScale = guidanceScale
+            maskConfig.imageGuidanceScale = imageGuidanceScale
+            maskConfig.schedulerType = scheduler.stableDiffusionScheduler
+            maskConfig.rngType = rng.stableDiffusionRNG
+            maskConfig.useDenoisedIntermediates = true
+            maskConfig.encoderScaleFactor = scaleFactor
+            maskConfig.decoderScaleFactor = scaleFactor
+
+            let maskPipeline = try ViS2OMaskPipeline(
+                resourcesAt: resourceURL,
+                configuration: config,
+                reduceMemory: reduceMemory
+            )
+            try maskPipeline.loadResources()
+            let images = try maskPipeline.generateImages(
+                configuration: maskConfig
+            ) { progress in
+                sampleTimer.stop()
+                log("\u{1B}[1A\u{1B}[K")
+                log("Step \(progress.step) of \(progress.stepCount)\n")
+                if progress.stepCount != progress.step {
+                    sampleTimer.start()
+                }
+                return true
+            }
+            _ = try saveImages(images, logNames: true)
+            return
+        }
 
         var pipelineConfig = StableDiffusionPipeline.Configuration(prompt: prompt)
         
@@ -354,11 +424,12 @@ enum ComputeUnits: String, ExpressibleByArgument, CaseIterable {
 
 @available(iOS 16.2, macOS 13.1, *)
 enum SchedulerOption: String, ExpressibleByArgument {
-    case pndm, dpmpp
+    case pndm, dpmpp, euler
     var stableDiffusionScheduler: StableDiffusionScheduler {
         switch self {
         case .pndm: return .pndmScheduler
         case .dpmpp: return .dpmSolverMultistepScheduler
+        case .euler: return .eulerAncestralDiscreteScheduler
         }
     }
 }

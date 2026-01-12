@@ -10,6 +10,12 @@ public protocol TextEncoderModel: ResourceManaging {
     func encode(_ text: String) throws -> MLShapedArray<Float32>
 }
 
+@available(iOS 16.2, macOS 13.1, *)
+public struct TextEncoderOutputs {
+    public let lastHiddenState: MLShapedArray<Float32>
+    public let pooledOutput: MLShapedArray<Float32>
+}
+
 ///  A model for encoding text
 @available(iOS 16.2, macOS 13.1, *)
 public struct TextEncoder: TextEncoderModel {
@@ -69,6 +75,18 @@ public struct TextEncoder: TextEncoderModel {
         return try encode(ids: ids)
     }
 
+    public func encodeWithOutputs(_ text: String) throws -> TextEncoderOutputs {
+        let inputLength = inputShape.last!
+        var (tokens, ids) = tokenizer.tokenize(input: text, minCount: inputLength)
+        if ids.count > inputLength {
+            tokens = tokens.dropLast(tokens.count - inputLength)
+            ids = ids.dropLast(ids.count - inputLength)
+            let truncated = tokenizer.decode(tokens: tokens)
+            print("Needed to truncate input '\(text)' to '\(truncated)'")
+        }
+        return try encodeOutputs(ids: ids)
+    }
+
     /// Prediction queue
     let queue = DispatchQueue(label: "textencoder.predict")
 
@@ -87,6 +105,40 @@ public struct TextEncoder: TextEncoderModel {
 
         let embeddingFeature = result.featureValue(for: "last_hidden_state")
         return MLShapedArray<Float32>(converting: embeddingFeature!.multiArrayValue!)
+    }
+
+    func encodeOutputs(ids: [Int]) throws -> TextEncoderOutputs {
+        let inputName = inputDescription.name
+        let inputShape = inputShape
+
+        let floatIds = ids.map { Float32($0) }
+        let inputArray = MLShapedArray<Float32>(scalars: floatIds, shape: inputShape)
+        let inputFeatures = try! MLDictionaryFeatureProvider(
+            dictionary: [inputName: MLMultiArray(inputArray)])
+
+        let result = try model.perform { model in
+            try model.prediction(from: inputFeatures)
+        }
+
+        guard let hiddenFeature = result.featureValue(for: "last_hidden_state") else {
+            throw TextEncoderError.missingOutput("last_hidden_state")
+        }
+        let hidden = MLShapedArray<Float32>(converting: hiddenFeature.multiArrayValue!)
+
+        let pooledFeature = result.featureValue(for: "pooled_outputs")
+            ?? result.featureValue(for: "pooler_output")
+
+        guard let pooledFeature else {
+            throw TextEncoderError.missingOutput("pooled_outputs/pooler_output")
+        }
+
+        let pooled = MLShapedArray<Float32>(converting: pooledFeature.multiArrayValue!)
+
+        return TextEncoderOutputs(lastHiddenState: hidden, pooledOutput: pooled)
+    }
+
+    enum TextEncoderError: Error {
+        case missingOutput(String)
     }
 
     var inputDescription: MLFeatureDescription {

@@ -80,6 +80,15 @@ public struct Unet: ResourceManaging {
         latentTimeIdDescription.multiArrayConstraint!.shape.map { $0.intValue }
     }
 
+    public func inputShape(named name: String) -> [Int]? {
+        try? models.first?.perform { model in
+            model.modelDescription.inputDescriptionsByName[name]?
+                .multiArrayConstraint?
+                .shape
+                .map { $0.intValue }
+        }
+    }
+
     /// Batch prediction noise from latent samples
     ///
     /// - Parameters:
@@ -91,7 +100,9 @@ public struct Unet: ResourceManaging {
         latents: [MLShapedArray<Float32>],
         timeStep: Int,
         hiddenStates: MLShapedArray<Float32>,
-        additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil
+        additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil,
+        instanceRepresentation: MLShapedArray<Float32>? = nil,
+        instanceMasks: MLShapedArray<Float32>? = nil
     ) throws -> [MLShapedArray<Float32>] {
 
         // Match time step batch dimension to the model / latent samples
@@ -113,6 +124,12 @@ public struct Unet: ResourceManaging {
                 "timestep" : MLMultiArray(t),
                 "encoder_hidden_states": MLMultiArray(hiddenStates)
             ]
+            if let instanceRepresentation {
+                dict["instance_representation"] = MLMultiArray(instanceRepresentation)
+            }
+            if let instanceMasks {
+                dict["instance_masks"] = MLMultiArray(instanceMasks)
+            }
             if let residuals = additionalResiduals?[$0.offset] {
                 for (k, v) in residuals {
                     dict[k] = MLMultiArray(v)

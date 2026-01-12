@@ -83,9 +83,9 @@ def split_einsum_v2(q, k, v, mask, heads, dim_head):
     - Chunks the query sequence to avoid large intermediate tensors and improves ANE performance
     """
     query_seq_length = q.size(3)
-    num_chunks = query_seq_length // CHUNK_SIZE
-    
-    if num_chunks == 0:
+    num_chunks = math.ceil(query_seq_length / CHUNK_SIZE)
+
+    if num_chunks <= 1:
         logger.info(
             "AttentionImplementations.SPLIT_EINSUM_V2: query sequence too short to chunk "
             f"({query_seq_length}<{CHUNK_SIZE}), fall back to AttentionImplementations.SPLIT_EINSUM (safe to ignore)")
@@ -101,8 +101,13 @@ def split_einsum_v2(q, k, v, mask, heads, dim_head):
     ]  # (bs, dim_head, 1, max_seq_length) * heads
 
     # Chunk the query sequence for each head
+    chunk_ranges = [
+        (chunk_idx * CHUNK_SIZE, min((chunk_idx + 1) * CHUNK_SIZE, query_seq_length))
+        for chunk_idx in range(num_chunks)
+    ]
+
     mh_q_chunked = [
-        [h_q[..., chunk_idx * CHUNK_SIZE:(chunk_idx + 1) * CHUNK_SIZE] for chunk_idx in range(num_chunks)]
+        [h_q[..., start:end] for (start, end) in chunk_ranges]
         for h_q in mh_q
     ]  # ((bs, dim_head, 1, QUERY_SEQ_CHUNK_SIZE) * num_chunks) * heads
 
@@ -118,12 +123,21 @@ def split_einsum_v2(q, k, v, mask, heads, dim_head):
           dim_head, :, :] for head_idx in range(heads)
     ]  # (bs, dim_head, 1, max_seq_length) * heads
 
-    attn_weights = [
-        [
-            torch.einsum("bchq,bkhc->bkhq", [qi_chunk, ki]) * (dim_head**-0.5)
-            for qi_chunk in h_q_chunked
-        ] for h_q_chunked, ki in zip(mh_q_chunked, mh_k)
-    ]  # ((bs, max_seq_length, 1, chunk_size) * num_chunks) * heads
+    if mask is not None:
+        mask_chunks = [mask[..., start:end] for (start, end) in chunk_ranges]
+    else:
+        mask_chunks = None
+
+    attn_weights = []
+    for h_q_chunked, ki in zip(mh_q_chunked, mh_k):
+        head_chunks = []
+        for chunk_idx, qi_chunk in enumerate(h_q_chunked):
+            aw_chunk = torch.einsum("bchq,bkhc->bkhq", [qi_chunk, ki]) * (dim_head**-0.5)
+            if mask_chunks is not None:
+                aw_chunk = aw_chunk + mask_chunks[chunk_idx]
+            head_chunks.append(aw_chunk)
+        attn_weights.append(head_chunks)
+    # ((bs, max_seq_length, 1, chunk_size) * num_chunks) * heads
 
     attn_weights = [
         [aw_chunk.softmax(dim=1) for aw_chunk in aw_chunked]

@@ -24,6 +24,7 @@ public extension StableDiffusionPipeline {
         public let controlledUnetChunk1URL: URL
         public let controlledUnetChunk2URL: URL
         public let multilingualTextEncoderProjectionURL: URL
+        public let seasonProjectorURL: URL
 
         public init(resourcesAt baseURL: URL) {
             textEncoderURL = baseURL.appending(path: "TextEncoder.mlmodelc")
@@ -40,6 +41,7 @@ public extension StableDiffusionPipeline {
             controlledUnetChunk1URL = baseURL.appending(path: "ControlledUnetChunk1.mlmodelc")
             controlledUnetChunk2URL = baseURL.appending(path: "ControlledUnetChunk2.mlmodelc")
             multilingualTextEncoderProjectionURL = baseURL.appending(path: "MultilingualTextEncoderProjection.mlmodelc")
+            seasonProjectorURL = baseURL.appending(path: "SeasonProjector.mlpackage")
         }
     }
 
@@ -137,6 +139,14 @@ public extension StableDiffusionPipeline {
         } else {
             encoder = nil
         }
+        
+        // Optional Season Projector
+        let seasonProjector: SeasonProjector?
+        if FileManager.default.fileExists(atPath: urls.seasonProjectorURL.path) {
+            seasonProjector = SeasonProjector(modelAt: urls.seasonProjectorURL, configuration: config)
+        } else {
+            seasonProjector = nil
+        }
 
         // Construct pipeline
         if #available(macOS 14.0, iOS 17.0, *) {
@@ -147,6 +157,7 @@ public extension StableDiffusionPipeline {
                 encoder: encoder,
                 controlNet: controlNet,
                 safetyChecker: safetyChecker,
+                seasonProjector: seasonProjector,
                 reduceMemory: reduceMemory,
                 useMultilingualTextEncoder: useMultilingualTextEncoder,
                 script: script
@@ -159,6 +170,7 @@ public extension StableDiffusionPipeline {
                 encoder: encoder,
                 controlNet: controlNet,
                 safetyChecker: safetyChecker,
+                seasonProjector: seasonProjector,
                 reduceMemory: reduceMemory
             )
         }

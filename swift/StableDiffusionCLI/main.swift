@@ -74,6 +74,12 @@ struct StableDiffusionSample: ParsableCommand {
     @Option(help: "Controls the influence of the image on sampling process (for ViS2O)")
     var imageGuidanceScale: Float = 1.5
 
+    @Option(help: "Season value for ViS2O (0.0 to 1.0)")
+    var seasonValue: Float = 0.5
+
+    @Option(help: "Controls the influence of the season condition on sampling process")
+    var seasonGuidanceScale: Float = 0.0
+
     @Flag(help: "Enable 8-channel UNet mode for ViS2O (concatenate image latents with noise latents)")
     var use8ChannelUNet: Bool = false
 
@@ -290,6 +296,8 @@ struct StableDiffusionSample: ParsableCommand {
         pipelineConfig.controlNetInputs = controlNetInputs
         pipelineConfig.guidanceScale = guidanceScale
         pipelineConfig.imageGuidanceScale = imageGuidanceScale
+        pipelineConfig.seasonValue = seasonValue
+        pipelineConfig.seasonGuidanceScale = seasonGuidanceScale
         pipelineConfig.use8ChannelUNet = use8ChannelUNet
         pipelineConfig.schedulerType = scheduler.stableDiffusionScheduler
         pipelineConfig.rngType = rng.stableDiffusionRNG

@@ -39,6 +39,10 @@ public struct PipelineConfiguration: Hashable {
     public var guidanceScale: Float = 7.5
     /// Controls the influence of the image on sampling process (for ViS2O)
     public var imageGuidanceScale: Float = 1.5
+    /// Season value for ViS2O (0.0 to 1.0)
+    public var seasonValue: Float = 0.5
+    /// Controls the influence of the season condition on sampling process
+    public var seasonGuidanceScale: Float = 3.0
     /// Enable 8-channel UNet mode (concatenate image latents with noise latents for ViS2O)
     public var use8ChannelUNet: Bool = false
     /// List of Images for available ControlNet Models

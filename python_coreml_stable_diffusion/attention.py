@@ -51,6 +51,8 @@ def split_einsum(q, k, v, mask, heads, dim_head):
     ]  # (bs, max_seq_length, 1, max_seq_length) * heads
 
     if mask is not None:
+        if mask.ndim == 4 and mask.shape[1] == q.shape[3]:
+            mask = mask.permute(0, 3, 2, 1)
         for head_idx in range(heads):
             attn_weights[head_idx] = attn_weights[head_idx] + mask
 
@@ -124,6 +126,8 @@ def split_einsum_v2(q, k, v, mask, heads, dim_head):
     ]  # (bs, dim_head, 1, max_seq_length) * heads
 
     if mask is not None:
+        if mask.ndim == 4 and mask.shape[1] == query_seq_length:
+            mask = mask.permute(0, 3, 2, 1)
         mask_chunks = [mask[..., start:end] for (start, end) in chunk_ranges]
     else:
         mask_chunks = None
@@ -173,6 +177,8 @@ def original(q, k, v, mask, heads, dim_head):
     attn_weights.mul_(dim_head**-0.5)
 
     if mask is not None:
+        if mask.ndim == 4 and mask.shape[1] == attn_weights.shape[2]:
+            mask = mask.permute(0, 2, 1, 3)
         attn_weights = attn_weights + mask
 
     attn_weights = attn_weights.softmax(dim=3)

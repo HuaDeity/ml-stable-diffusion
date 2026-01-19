@@ -10,7 +10,7 @@ from collections import OrderedDict
 from copy import deepcopy
 
 import coremltools as ct
-from diffusers import ControlNetModel, DiffusionPipeline
+from diffusers import ControlNetModel, DiffusionPipeline, UNet2DConditionModel
 from diffusionkit.tests.torch2coreml import convert_mmdit_to_mlpackage, convert_vae_to_mlpackage
 from huggingface_hub import snapshot_download
 
@@ -192,10 +192,18 @@ def _resolve_mask_components_path(args):
         return None
     if not os.path.isabs(candidate):
         candidate = os.path.abspath(os.path.join(os.getcwd(), candidate))
-    if os.path.isdir(os.path.join(candidate, "mask_processor")) and os.path.isdir(
+
+    # Check for Mask Components
+    has_mask = os.path.isdir(os.path.join(candidate, "mask_processor")) and os.path.isdir(
         os.path.join(candidate, "instance_representation_module")
-    ):
+    )
+
+    # Check for Season Components
+    has_season = os.path.isdir(os.path.join(candidate, "season_projector"))
+
+    if has_mask or has_season:
         return candidate
+
     return None
 
 
@@ -292,18 +300,139 @@ def _convert_instance_representation(args, mask_components_path):
     logger.info(f"Saved InstanceRepresentationModule to {out_path}")
 
 
+def _load_vis2o_season_components():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if repo_root not in sys.path:
+        sys.path.append(repo_root)
+    try:
+        from models.season_encoder import create_season_projector
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import ViS2O season components. Ensure the ViS2O repo root is available."
+        ) from exc
+    return create_season_projector
+
+
+def _convert_season_projector(args, season_components_path):
+    out_path = os.path.join(args.o, "SeasonProjector.mlpackage")
+    if os.path.exists(out_path):
+        logger.info(f"Skipping SeasonProjector export because {out_path} already exists")
+        return
+
+    create_season_projector = _load_vis2o_season_components()
+
+    # Instantiate model using args
+    # Note: We need to handle potential mismatch in args structure
+    # For now, pass 'args' directly as it should contain necessary flags
+    try:
+        model = create_season_projector(args)
+    except Exception as e:
+        logger.error(f"Failed to create season projector: {e}")
+        return
+
+    weights_path = os.path.join(season_components_path, "season_projector", "model.safetensors")
+    if os.path.exists(weights_path):
+        logger.info(f"Loading SeasonProjector weights from {weights_path}")
+        state_dict = load_file(weights_path)
+        model.load_state_dict(state_dict)
+    else:
+        logger.warning(f"SeasonProjector weights not found at {weights_path}, using random weights")
+
+    model.eval()
+
+    # Tracing inputs: season_value [B, 1], base_norm [B, 1] (optional), contains_snow [B, 1] (optional)
+    # We will trace with all inputs to be safe, or just season_value if others are optional/unused in inference
+    # However, if the model uses them, we must provide them.
+    # Standard usage in pipeline: season_value is mandatory.
+
+    dummy_bs = 2
+    dummy_season = torch.rand(dummy_bs, 1)
+
+    # We trace with just season_value for simplicity if other inputs are optional/defaults
+    # But wait, forward signature: forward(season_value, base_norm=None, contains_snow=None, ...)
+    # If we want to support snow, we should trace with it.
+
+    # Check if model uses snow
+    use_snow = getattr(model, "use_snow_anchor", False)
+
+    inputs = [dummy_season]
+    coreml_inputs = [ct.TensorType(name="season_value", shape=(1, 1), dtype=np.float32)]
+
+    # If we want to support optional inputs in CoreML, we have to include them in the trace
+    # CoreML doesn't support 'None' inputs well for optional args in traced models easily without wrapper.
+    # Best practice: Trace with all inputs that might be used.
+
+    # Let's create a wrapper to handle defaults if needed, or just force providing them.
+    # For ViS2O pipeline, we usually control snow.
+
+    class SeasonProjectorWrapper(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, season_value):
+            # Hardcode other inputs to None/Default for now to simplify
+            return self.model(season_value)
+
+    if use_snow:
+        # If snow is used, we probably want to expose it.
+        # But for 'season_value' test requested, maybe snow is not focus.
+        # Let's try to expose 'contains_snow' as input if enabled.
+
+        dummy_snow = torch.zeros(dummy_bs, 1)
+
+        class SeasonProjectorWrapperWithSnow(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, season_value, contains_snow):
+                return self.model(season_value, contains_snow=contains_snow)
+
+        traced_model = torch.jit.trace(SeasonProjectorWrapperWithSnow(model), (dummy_season, dummy_snow))
+        coreml_inputs.append(ct.TensorType(name="contains_snow", shape=(1, 1), dtype=np.float32))
+    else:
+        traced_model = torch.jit.trace(SeasonProjectorWrapper(model), (dummy_season,))
+
+    deployment_target = _get_deployment_target(args.min_deployment_target)
+    compute_unit = ct.ComputeUnit[args.compute_unit]
+
+    # Output is embeddings
+    outputs = [ct.TensorType(name="season_embeddings", dtype=np.float32)]
+
+    mlmodel = ct.convert(
+        traced_model,
+        inputs=coreml_inputs,
+        outputs=outputs,
+        minimum_deployment_target=deployment_target,
+        compute_units=compute_unit,
+    )
+
+    # Set metadata
+    mlmodel.short_description = "Encodes season value (0-1) into embedding tokens"
+
+    mlmodel.save(out_path)
+    logger.info(f"Saved SeasonProjector to {out_path}")
+
+
 def convert_mask_components(args):
     mask_components_path = _resolve_mask_components_path(args)
     if not mask_components_path:
-        raise ValueError(
-            "Mask components path not found. Provide --mask-components-path or use a model-version that includes "
-            "mask_processor/ and instance_representation_module/."
-        )
+        # Fallback to model_version if it looks like a path
+        if os.path.isdir(args.model_version):
+            mask_components_path = args.model_version
+        else:
+            # Just warn and return if not explicit
+            if args.convert_mask_components:
+                raise ValueError("Mask/Season components path not found.")
+            return
 
     if args.convert_mask_components or args.convert_mask_processor:
         _convert_mask_processor(args, mask_components_path)
     if args.convert_mask_components or args.convert_instance_representation:
         _convert_instance_representation(args, mask_components_path)
+    if args.convert_season_projector:
+        _convert_season_projector(args, mask_components_path)  # Re-using path var name but logic applies
 
 
 def quantize_weights(args):
@@ -417,6 +546,7 @@ def bundle_resources_for_swift_cli(args):
     for source_name, target_name in [
         ("MaskProcessor", "MaskProcessor"),
         ("InstanceRepresentationModule", "InstanceRepresentationModule"),
+        ("SeasonProjector", "SeasonProjector"),
     ]:
         source_path = os.path.join(args.o, f"{source_name}.mlpackage")
         if os.path.exists(source_path):
@@ -909,6 +1039,29 @@ def convert_vae_encoder(pipe, args):
     gc.collect()
 
 
+def _flatten_lora_weights(state_dict):
+    """
+    Flattens a state_dict from a model with fused (but not unloaded) LoRA adapters.
+    - Renames '*.base_layer.weight' -> '*.weight'
+    - Renames '*.base_layer.bias'   -> '*.bias'
+    - Drops '*.lora_A.*', '*.lora_B.*', '*.lora_magnitude_vector'
+    """
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        if "lora_" in k or "lora_magnitude_vector" in k:
+            continue
+
+        if k.endswith(".base_layer.weight"):
+            new_k = k.replace(".base_layer.weight", ".weight")
+            new_state_dict[new_k] = v
+        elif k.endswith(".base_layer.bias"):
+            new_k = k.replace(".base_layer.bias", ".bias")
+            new_state_dict[new_k] = v
+        else:
+            new_state_dict[k] = v
+    return new_state_dict
+
+
 def convert_unet(pipe, args, model_name=None):
     """Converts the UNet component of Stable Diffusion"""
     if args.unet_support_controlnet:
@@ -1040,8 +1193,14 @@ def convert_unet(pipe, args, model_name=None):
         ).eval()
 
         state_dict = pipe.unet.state_dict()
+
+        # CLEANUP: Flatten LoRA keys if present
+        state_dict = _flatten_lora_weights(state_dict)
+
         if args.enable_instance_attn:
-            processor_weights = _load_instance_processor_weights(args.model_version)
+            processor_weights = _load_instance_processor_weights(
+                args.model_version, unet_path=args.unet_path, mask_path=args.mask_components_path
+            )
             for k, v in processor_weights.items():
                 if ".processor." in k and k not in state_dict:
                     state_dict[k] = v
@@ -1649,22 +1808,109 @@ def get_pipeline(args):
             model_version, torch_dtype=torch.float16, variant="fp16", use_safetensors=True, use_auth_token=True
         )
 
+    if args.unet_path:
+        logger.info(f"Loading custom UNet from {args.unet_path}..")
+        unet_state_path = None
+        unet_candidates = []
+        if os.path.isdir(args.unet_path):
+            unet_candidates = [
+                os.path.join(args.unet_path, "diffusion_pytorch_model.safetensors"),
+                os.path.join(args.unet_path, "model.safetensors"),
+                os.path.join(args.unet_path, "diffusion_pytorch_model.bin"),
+                os.path.join(args.unet_path, "pytorch_model.bin"),
+            ]
+        else:
+            unet_candidates = [args.unet_path]
+
+        for path in unet_candidates:
+            if os.path.exists(path):
+                unet_state_path = path
+                break
+
+        if unet_state_path is None:
+            raise FileNotFoundError(
+                f"UNet weights not found in {args.unet_path}. Checked: {unet_candidates}"
+            )
+
+        if os.path.isdir(args.unet_path):
+            unet_config = UNet2DConditionModel.load_config(args.unet_path)
+            pipe.unet = UNet2DConditionModel.from_config(unet_config)
+
+        if unet_state_path.endswith(".safetensors"):
+            unet_state = load_file(unet_state_path)
+        else:
+            unet_state = torch.load(unet_state_path, map_location="cpu")
+
+        unet_state = _flatten_lora_weights(unet_state)
+        missing, unexpected = pipe.unet.load_state_dict(unet_state, strict=False)
+        if missing:
+            logger.warning(f"Missing UNet keys after load: {missing}")
+        if unexpected:
+            logger.warning(f"Unexpected UNet keys after load: {unexpected}")
+
+        pipe.unet.to(torch.float16)
+
+    if args.lora_weights:
+        lora_specs = []
+        for raw_spec in args.lora_weights.split(","):
+            spec = raw_spec.strip()
+            if not spec:
+                continue
+            lora_path = spec
+            lora_scale = args.lora_scale
+            if ":" in spec:
+                maybe_path, maybe_scale = spec.rsplit(":", 1)
+                try:
+                    lora_scale = float(maybe_scale)
+                    lora_path = maybe_path
+                except ValueError:
+                    lora_scale = args.lora_scale
+                    lora_path = spec
+            lora_specs.append((lora_path, lora_scale))
+
+        for i, (lora_path, lora_scale) in enumerate(lora_specs):
+            logger.info(f"Loading LoRA weights from {lora_path}..")
+            adapter_name = f"lora_{i}"
+            try:
+                pipe.load_lora_weights(lora_path, adapter_name=adapter_name)
+            except TypeError:
+                pipe.load_lora_weights(lora_path)
+                adapter_name = "default"
+
+            logger.info(f"Fusing LoRA weights with scale {lora_scale}..")
+            if hasattr(pipe, "set_adapters"):
+                pipe.set_adapters([adapter_name], adapter_weights=[lora_scale])
+                pipe.fuse_lora()
+            else:
+                pipe.fuse_lora(lora_scale=lora_scale)
+
     logger.info(f"Done. Pipeline in effect: {pipe.__class__.__name__}")
 
     return pipe
 
 
-def _load_instance_processor_weights(model_version):
-    candidates = [
-        os.path.join(model_version, "unet", "diffusion_pytorch_model.safetensors"),
-        os.path.join(model_version, "unet", "model.safetensors"),
-    ]
+def _load_instance_processor_weights(model_version, unet_path=None, mask_path=None):
+    candidates = []
+
+    if unet_path:
+        candidates.append(os.path.join(unet_path, "diffusion_pytorch_model.safetensors"))
+        candidates.append(os.path.join(unet_path, "model.safetensors"))
+        if os.path.isfile(unet_path):
+            candidates.append(unet_path)
+
+    if mask_path:
+        candidates.append(os.path.join(mask_path, "unet", "diffusion_pytorch_model.safetensors"))
+        candidates.append(os.path.join(mask_path, "unet", "model.safetensors"))
+
+    candidates.append(os.path.join(model_version, "unet", "diffusion_pytorch_model.safetensors"))
+    candidates.append(os.path.join(model_version, "unet", "model.safetensors"))
+
     for path in candidates:
         if os.path.exists(path):
+            logger.info(f"Loading instance processor weights from {path}")
             return load_file(path)
-    raise FileNotFoundError(
-        f"UNet weights not found in {model_version}/unet (checked diffusion_pytorch_model.safetensors, model.safetensors)"
-    )
+
+    raise FileNotFoundError(f"UNet weights not found. Checked: {candidates}")
 
 
 def _normalize_instance_processor_state_dict(state_dict):
@@ -1711,7 +1957,12 @@ def main(args):
         convert_unet(pipe, args)
         logger.info("Converted unet")
 
-    if args.convert_mask_components or args.convert_mask_processor or args.convert_instance_representation:
+    if (
+        args.convert_mask_components
+        or args.convert_mask_processor
+        or args.convert_instance_representation
+        or args.convert_season_projector
+    ):
         logger.info("Converting mask components")
         convert_mask_components(args)
         logger.info("Converted mask components")
@@ -1775,6 +2026,18 @@ def parser_spec():
     parser.add_argument("--convert-mask-processor", action="store_true")
     parser.add_argument("--convert-instance-representation", action="store_true")
     parser.add_argument("--convert-mask-components", action="store_true")
+    parser.add_argument("--convert-season-projector", action="store_true", help="Convert SeasonProjector model")
+
+    # Season Projector Config
+    parser.add_argument("--season-encoder-type", type=str, default="fourier_exponential")
+    parser.add_argument("--season-projector-hidden-dim", type=int, default=256)
+    parser.add_argument("--season-projector-fourier-dim", type=int, default=32)
+    parser.add_argument("--season-projector-max-freq", type=float, default=12.0)
+    parser.add_argument("--season-num-tokens", type=int, default=1)
+    parser.add_argument("--rbf-num-centers", type=int, default=48)
+    parser.add_argument("--rbf-learnable-centers", action="store_true", default=True)
+    parser.add_argument("--rbf-learnable-bandwidth", action="store_true", default=True)
+
     parser.add_argument(
         "--convert-controlnet",
         nargs="*",
@@ -1974,6 +2237,27 @@ def parser_spec():
         "--sd3-version",
         action="store_true",
         help=("If specified, the pre-trained model will be treated as an SD3 model."),
+    )
+    parser.add_argument(
+        "--unet-path",
+        type=str,
+        default=None,
+        help="Path to a custom UNet to replace the pipeline's UNet.",
+    )
+    parser.add_argument(
+        "--lora-weights",
+        type=str,
+        default=None,
+        help=(
+            "Path(s) to the LoRA weights (directory or file) to load and fuse into the model. "
+            "Use comma-separated entries, optionally with per-LoRA scale suffix like path:0.75."
+        ),
+    )
+    parser.add_argument(
+        "--lora-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for the LoRA weights when fusing.",
     )
 
     return parser

@@ -81,6 +81,9 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 
     /// Optional model used before Unet to control generated images by additonal inputs
     var controlNet: ControlNet? = nil
+    
+    /// Optional model for projecting season value to embeddings
+    var seasonProjector: SeasonProjector? = nil
 
     /// Reports whether this pipeline can perform safety checks
     public var canSafetyCheck: Bool {
@@ -109,6 +112,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     ///   - decoder: Model for decoding latent sample to image
     ///   - controlNet: Optional model to control generated images by additonal inputs
     ///   - safetyChecker: Optional model for checking safety of generated images
+    ///   - seasonProjector: Optional model for projecting season values
     ///   - reduceMemory: Option to enable reduced memory mode
     /// - Returns: Pipeline ready for image generation
     public init(
@@ -118,6 +122,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         encoder: Encoder?,
         controlNet: ControlNet? = nil,
         safetyChecker: SafetyChecker? = nil,
+        seasonProjector: SeasonProjector? = nil,
         reduceMemory: Bool = false
     ) {
         self.textEncoder = textEncoder
@@ -126,6 +131,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         self.encoder = encoder
         self.controlNet = controlNet
         self.safetyChecker = safetyChecker
+        self.seasonProjector = seasonProjector
         self.reduceMemory = reduceMemory
     }
 
@@ -137,6 +143,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     ///   - decoder: Model for decoding latent sample to image
     ///   - controlNet: Optional model to control generated images by additonal inputs
     ///   - safetyChecker: Optional model for checking safety of generated images
+    ///   - seasonProjector: Optional model for projecting season values
     ///   - reduceMemory: Option to enable reduced memory mode
     ///   - useMultilingualTextEncoder: Option to use system multilingual NLContextualEmbedding as encoder
     ///   - script: Optional natural language script to use for the text encoder.
@@ -149,6 +156,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         encoder: Encoder?,
         controlNet: ControlNet? = nil,
         safetyChecker: SafetyChecker? = nil,
+        seasonProjector: SeasonProjector? = nil,
         reduceMemory: Bool = false,
         useMultilingualTextEncoder: Bool = false,
         script: Script? = nil
@@ -159,6 +167,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         self.encoder = encoder
         self.controlNet = controlNet
         self.safetyChecker = safetyChecker
+        self.seasonProjector = seasonProjector
         self.reduceMemory = reduceMemory
         self.useMultilingualTextEncoder = useMultilingualTextEncoder
         self.script = script
@@ -178,6 +187,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             try encoder?.loadResources()
             try controlNet?.loadResources()
             try safetyChecker?.loadResources()
+            try seasonProjector?.loadResources()
         }
     }
 
@@ -189,6 +199,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         encoder?.unloadResources()
         controlNet?.unloadResources()
         safetyChecker?.unloadResources()
+        seasonProjector?.unloadResources()
     }
 
     // Prewarm resources one at a time
@@ -199,6 +210,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         try encoder?.prewarmResources()
         try controlNet?.prewarmResources()
         try safetyChecker?.prewarmResources()
+        try seasonProjector?.prewarmResources()
     }
 
     /// Image generation using stable diffusion
@@ -215,11 +227,48 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         // Encode the input prompt
         var promptEmbedding = try textEncoder.encode(config.prompt)
 
-        // Dual guidance for ViS2O: [image_conditional, unconditional]
-        // Updated to match batch_size=2 model
+        // Dual/Triple guidance for ViS2O
         let useDualImageGuidance = config.use8ChannelUNet && config.imageGuidanceScale >= 1.0
+        let useSeasonGuidance = config.seasonGuidanceScale > 0 && seasonProjector != nil
 
-        if config.use8ChannelUNet {
+        if useSeasonGuidance {
+            // Triple Guidance: [Season+Text, Image+Text, Text]
+            // We interpret "Text" as the "Unconditional" baseline in this context (Null season + Null/Base image)
+            // But actually standard ViS2O logic is:
+            // 1. Full: Season + Image
+            // 2. ImageOnly: NullSeason + Image
+            // 3. Uncond: NullSeason + NoImage
+            
+            // Generate season tokens
+            let seasonTokens = try seasonProjector!.project(seasonValue: config.seasonValue)
+            // Assuming seasonTokens is [1, 1, 1, C] or [1, N, 1, C] -> Need to match [B, C, 1, S] format of promptEmbedding?
+            // Wait, TextEncoder returns [1, 77, 768] (B, S, C) usually, or [B, C, 1, S] after `toHiddenStates`
+            
+            // TextEncoder encode returns MLShapedArray<Float32> with shape [1, 77, 768]
+            
+            // Project to hidden states format [1, 768, 1, 77]
+            var hiddenStatesText = toHiddenStates(promptEmbedding)
+            
+            // Season tokens: [1, 1, 768] -> [1, 768, 1, 1]
+            var seasonHidden = toHiddenStates(seasonTokens)
+            
+            // Null season tokens
+            var nullSeasonHidden = MLShapedArray<Float32>(repeating: 0.0, shape: seasonHidden.shape)
+            
+            // Concatenate along sequence length (last dimension, index 3)
+            // [1, 768, 1, 77] + [1, 768, 1, 1] -> [1, 768, 1, 78]
+            
+            let fullEmbed = MLShapedArray<Float32>(concatenating: [hiddenStatesText, seasonHidden], alongAxis: 3)
+            let imageEmbed = MLShapedArray<Float32>(concatenating: [hiddenStatesText, nullSeasonHidden], alongAxis: 3)
+            let uncondEmbed = MLShapedArray<Float32>(concatenating: [hiddenStatesText, nullSeasonHidden], alongAxis: 3)
+            
+            // Batch: [Full, ImageOnly, Uncond]
+            promptEmbedding = MLShapedArray<Float32>(
+                concatenating: [fullEmbed, imageEmbed, uncondEmbed],
+                alongAxis: 0
+            )
+            
+        } else if config.use8ChannelUNet {
             promptEmbedding = MLShapedArray<Float32>(
                 concatenating: [promptEmbedding, promptEmbedding],
                 alongAxis: 0
@@ -235,10 +284,11 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 
         if reduceMemory {
             textEncoder.unloadResources()
+            seasonProjector?.unloadResources()
         }
 
-        let hiddenStates =
-            useMultilingualTextEncoder ? promptEmbedding : toHiddenStates(promptEmbedding)
+        let hiddenStates = useSeasonGuidance ? promptEmbedding :
+            (useMultilingualTextEncoder ? promptEmbedding : toHiddenStates(promptEmbedding))
 
         /// Setup schedulers
         let scheduler: [Scheduler] = (0..<config.imageCount).map { _ in
@@ -331,7 +381,13 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             // Expand the latents for classifier-free guidance
             // and input to the Unet noise prediction model
             var latentUnetInput: [MLShapedArray<Float32>]
-            if config.guidanceScale >= 1.0 || useDualImageGuidance {
+            
+            if useSeasonGuidance {
+                // 3-Branch: [Full, Image, Uncond]
+                latentUnetInput = scaledLatents.map {
+                    MLShapedArray<Float32>(concatenating: [$0, $0, $0], alongAxis: 0)
+                }
+            } else if config.guidanceScale >= 1.0 || useDualImageGuidance {
                 latentUnetInput = scaledLatents.map {
                     MLShapedArray<Float32>(concatenating: [$0, $0], alongAxis: 0)
                 }
@@ -343,7 +399,15 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             if config.use8ChannelUNet, let imgLatents = imageLatents {
                 latentUnetInput = zip(latentUnetInput, imgLatents).map { noiseLatent, imgLatent in
                     var expandedImageLatent: MLShapedArray<Float32>
-                    if useDualImageGuidance {
+                    
+                    if useSeasonGuidance {
+                        // 3-Branch: [Image, Image, Zeros]
+                        let zeros = MLShapedArray<Float32>(repeating: 0.0, shape: imgLatent.shape)
+                        expandedImageLatent = MLShapedArray<Float32>(
+                            concatenating: [imgLatent, imgLatent, zeros],
+                            alongAxis: 0
+                        )
+                    } else if useDualImageGuidance {
                         // For dual image guidance: [image, zeros]
                         let zeros = MLShapedArray<Float32>(repeating: 0.0, shape: imgLatent.shape)
                         expandedImageLatent = MLShapedArray<Float32>(
@@ -379,7 +443,15 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             // Predict noise residuals from latent samples
             // and current time step conditioned on hidden states
             var noise: [MLShapedArray<Float32>]
-            if unet.latentSampleShape[0] >= 2 || config.guidanceScale < 1.0 {
+            if unet.latentSampleShape[0] >= 3 && useSeasonGuidance {
+                 // Batch size 3
+                 noise = try unet.predictNoise(
+                    latents: latentUnetInput,
+                    timeStep: t,
+                    hiddenStates: hiddenStates,
+                    additionalResiduals: additionalResiduals
+                )
+            } else if unet.latentSampleShape[0] >= 2 || config.guidanceScale < 1.0 {
                 // One predict call from the uNet, using batching if needed
                 noise = try unet.predictNoise(
                     latents: latentUnetInput,
@@ -388,38 +460,26 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                     additionalResiduals: additionalResiduals
                 )
             } else {
-                // Serial predictions from uNet
-                var hidden0 = MLShapedArray<Float32>(converting: hiddenStates[0])
-                hidden0 = MLShapedArray(scalars: hidden0.scalars, shape: [1] + hidden0.shape)
-                let noise_pred_uncond = try unet.predictNoise(
-                    latents: scaledLatents,
+                // Serial predictions not implemented for 3-branch yet
+                // Use batching
+                 noise = try unet.predictNoise(
+                    latents: latentUnetInput,
                     timeStep: t,
-                    hiddenStates: hidden0,
+                    hiddenStates: hiddenStates,
                     additionalResiduals: additionalResiduals
                 )
-
-                var hidden1 = MLShapedArray<Float32>(converting: hiddenStates[1])
-                hidden1 = MLShapedArray(scalars: hidden1.scalars, shape: [1] + hidden1.shape)
-                let noise_pred_text = try unet.predictNoise(
-                    latents: scaledLatents,
-                    timeStep: t,
-                    hiddenStates: hidden1,
-                    additionalResiduals: additionalResiduals
-                )
-
-                noise = [
-                    MLShapedArray<Float32>(
-                        concatenating: [noise_pred_uncond[0], noise_pred_text[0]],
-                        alongAxis: 0)
-                ]
             }
 
             // Apply guidance
-            if useDualImageGuidance {
+            if !noise.isEmpty {
+                print("DEBUG: Noise shape: \(noise[0].shape)")
+            }
+            if useSeasonGuidance {
+                noise = performTripleGuidance(noise, config.seasonGuidanceScale, config.imageGuidanceScale)
+            } else if useDualImageGuidance {
                 noise = performDualImageGuidance(noise, config.imageGuidanceScale)
             } else if config.use8ChannelUNet {
                 // For ViS2O with CFG disabled: just use first prediction (both are identical)
-                // This matches Python behavior: noise_pred = noise_pred[0:1]
                 noise = noise.map { noisePred in
                     let shape = noisePred.shape
                     let singleBatchShape = [1] + shape.dropFirst()
@@ -634,6 +694,41 @@ extension StableDiffusionPipelineProtocol {
                         at: i,
                         to: uncondPred + imageGuidanceScale * (imagePred - uncondPred)
                     )
+                }
+            }
+        }
+    }
+
+    // ViS2O triple guidance: [Full, Image, Uncond]
+    func performTripleGuidance(_ noise: [MLShapedArray<Float32>], _ seasonGuidanceScale: Float, _ imageGuidanceScale: Float)
+        -> [MLShapedArray<Float32>]
+    {
+        noise.map { performTripleGuidance($0, seasonGuidanceScale, imageGuidanceScale) }
+    }
+
+    func performTripleGuidance(_ noise: MLShapedArray<Float32>, _ seasonGuidanceScale: Float, _ imageGuidanceScale: Float)
+        -> MLShapedArray<Float32>
+    {
+        var shape = noise.shape
+        shape[0] = 1
+        return MLShapedArray<Float>(unsafeUninitializedShape: shape) { result, _ in
+            noise.withUnsafeShapedBufferPointer { scalars, _, strides in
+                print("DEBUG TripleGuidance: noise.shape=\(noise.shape), scalars.count=\(scalars.count), strides=\(strides), result.count=\(result.count)")
+                for i in 0..<result.count {
+                    // 3-Branch Guidance
+                    // Full (index 0), Image (index 1), Uncond (index 2)
+                    // strides[0] is the step to next batch item
+                    
+                    let fullPred = scalars[i]
+                    let imgPred = scalars[strides[0] + i]
+                    let uncondPred = scalars[2 * strides[0] + i]
+                    
+                    // Formula: uncond + image_scale * (img - uncond) + season_scale * (full - img)
+                    let value = uncondPred +
+                                imageGuidanceScale * (imgPred - uncondPred) +
+                                seasonGuidanceScale * (fullPred - imgPred)
+                    
+                    result.initializeElement(at: i, to: value)
                 }
             }
         }
